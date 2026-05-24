@@ -181,19 +181,19 @@ Four of the five tested sectors produced actionable forecasting signals at plann
 
 **Screenshots:**
 - *Sector × Horizon Out-of-Sample MAPE Matrix*
-<img width="1500" height="800" alt="Sector × Horizon MAPE Matrix" src="Screenshots/1.png" />
+<img width="1200" height="600" alt="Sector × Horizon MAPE Matrix" src="Screenshots/1.png" />
 
 - *Data Center 5-Quarter Ahead Forecast Plot*
-<img width="1500" height="800" alt="Data Center Full Timeline" src="Screenshots/2.png" />
+<img width="1200" height="600" alt="Data Center Full Timeline" src="Screenshots/2.png" />
 
 - *Manufacturing 5-Quarter Ahead Forecast Plot*
-<img width="1500" height="800" alt="Manufacturing Full Timeline" src="Screenshots/3.png" />
+<img width="1200" height="600" alt="Manufacturing Full Timeline" src="Screenshots/3.png" />
 
 - *Cross-Sector Summary Table*
 <img width="1500" height="800" alt="Cross-Sector Summary" src="Screenshots/4.png" />
 
 - *Sample Regression Coefficient Output*
-<img width="1500" height="800" alt="DC Regression Coefficients" src="Screenshots/5.png" />
+<img width="1200" height="600" alt="DC Regression Coefficients" src="Screenshots/5.png" />
 
 **Key Learning Outcomes:**\
 *This project demonstrates practical experience with:*
