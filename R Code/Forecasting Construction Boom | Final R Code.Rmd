@@ -1,0 +1,5506 @@
+---
+title: "Lithko - Team UD | Predicting the Next Construction Boom"
+---
+
+```{r}
+# CHUNK 1 — Load libraries
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(readxl)
+library(broom)
+library(corrplot)
+library(scales)
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+# CHUNK 1b — Shared helper functions
+# These are reused across all 5 sector analyses (Data Center, Warehouse,
+# Apartment, Office, Manufacturing). Defined once here to avoid repetition.
+
+calculate_error_metrics <- function(actual, predicted) {
+  tibble(
+    MAE  = mean(abs(actual - predicted), na.rm = TRUE),
+    MAPE = mean(abs((actual - predicted) / actual) * 100, na.rm = TRUE),
+    RMSE = sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+  )
+}
+```
+
+```{r}
+# Chunk 2 — Load Lithko internal data
+jobs <- read_csv("job data", show_col_types = FALSE) %>% clean_names()
+labor <- read_csv("labor hours data", show_col_types = FALSE) %>% clean_names()
+customers <- read_csv("customer data", show_col_types = FALSE) %>% clean_names()
+business_unit <- read_csv("business unit data", show_col_types = FALSE) %>% clean_names()
+region <- read_csv("Region data", show_col_types = FALSE) %>% clean_names()
+```
+
+```{r}
+# Chunk 3 — Standardize dates and build true construction start
+jobs <- jobs %>%
+  mutate(creation_date = as_datetime(creation_date))
+
+labor <- labor %>%
+  mutate(work_date = as_date(work_date))
+
+true_job_start <- labor %>%
+  group_by(job_id) %>%
+  summarise(
+    true_start_date = min(work_date, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+jobs
+labor
+true_job_start
+```
+
+```{r}
+# Chunk 4 — Build enriched Lithko dataset
+jobs_enriched <- jobs %>%
+  left_join(true_job_start, by = "job_id") %>%
+  left_join(
+    business_unit %>%
+      rename(
+        bu_name = name,
+        bu_city = city,
+        bu_state = st_cd
+      ),
+    by = "ou_id"
+  ) %>%
+  left_join(
+    region %>% select(ou_id, region),
+    by = "ou_id"
+  ) %>%
+  left_join(customers, by = "cus_id")
+```
+
+```{r}
+# Chunk 5 — Filter to warehouse and data center
+## 5. Filter Target Segments and Assign Quarter
+
+jobs_filtered <- jobs_enriched %>%
+  filter(project_type %in% c("WAREHOUSE", "DATA CENTER")) %>%
+  mutate(
+    quarter = floor_date(true_start_date, "quarter")
+  )
+```
+
+```{r}
+# Chunk 6 — Build quarterly internal activity dataset
+## 6. Build Quarterly Internal Activity Dataset
+
+job_starts_quarterly <- jobs_filtered %>%
+  group_by(project_type, quarter) %>%
+  summarise(
+    job_starts = n_distinct(job_id),
+    .groups = "drop"
+  )
+
+labor_hours_quarterly <- labor %>%
+  left_join(
+    jobs_filtered %>% select(job_id, project_type),
+    by = "job_id"
+  ) %>%
+  mutate(
+    quarter = floor_date(work_date, "quarter")
+  ) %>%
+  filter(!is.na(project_type)) %>%
+  group_by(project_type, quarter) %>%
+  summarise(
+    labor_hours = sum(hrs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+baseline_quarterly <- job_starts_quarterly %>%
+  left_join(labor_hours_quarterly, by = c("project_type", "quarter")) %>%
+  arrange(project_type, quarter)
+```
+
+```{r}
+# Chunk 7 — Remove incomplete final quarter
+## 7. Remove Incomplete Final Quarter
+
+max_work_date <- max(labor$work_date, na.rm = TRUE)
+last_quarter_start <- floor_date(max_work_date, "quarter")
+last_complete_quarter <- last_quarter_start %m-% months(3)
+
+baseline_quarterly_complete <- baseline_quarterly %>%
+  filter(quarter <= last_complete_quarter)
+```
+
+```markdown
+## Chunk 8 - Data Center Segment Analysis
+
+This section focuses on Lithko’s historical data-center-related construction activity and evaluates whether selected external indicators improve early-signal forecasting performance relative to an internal-only baseline. Following project feedback, the goal is not to build a black-box prediction system, but to test whether a small set of explainable external variables improves directional planning support.
+```
+
+```{r}
+# CHUNK 9 — Load Data Center External Indicators
+
+data_center_spending <- read_csv("monthly-spending-data-center-us.csv", show_col_types = FALSE) %>%
+  clean_names()
+
+tcu_raw <- read_excel("Capacity Utilization Total Index.xlsx", sheet = "Monthly") %>%
+  clean_names()
+
+pce_raw <- read_excel("Personal consumption expenditures (implicit price deflator).xlsx", sheet = "Quarterly") %>%
+  clean_names()
+
+electricity_raw <- read_excel("Industrial Production Utilities Electric and Gas Utilities.xlsx", sheet = "Monthly") %>%
+  clean_names()
+```
+
+```{r}
+# CHUNK 10 — Clean External Indicators
+
+data_center_spending <- data_center_spending %>%
+  rename(
+    observation_date = day,
+    dc_spending = monthly_spending_on_data_center_construction_in_the_united_states
+  ) %>%
+  mutate(
+    observation_date = as_date(observation_date)
+  ) %>%
+  select(observation_date, dc_spending)
+
+tcu_clean <- tcu_raw %>%
+  mutate(
+    observation_date = as_date(observation_date)
+  ) %>%
+  select(observation_date, tcu)
+
+pce_clean <- pce_raw %>%
+  rename(
+    pce_deflator = dpcerd3q086sbea
+  ) %>%
+  mutate(
+    observation_date = as_date(observation_date)
+  ) %>%
+  select(observation_date, pce_deflator)
+
+electricity_clean <- electricity_raw %>%
+  rename(
+    utility_production = ipg2211a2n
+  ) %>%
+  mutate(
+    observation_date = as_date(observation_date)
+  ) %>%
+  select(observation_date, utility_production)
+```
+
+```{r}
+# CHUNK 11 — Convert External Indicators to Quarterly Frequency
+
+min_q <- min(baseline_quarterly_complete$quarter, na.rm = TRUE)
+max_q <- max(baseline_quarterly_complete$quarter, na.rm = TRUE)
+
+to_quarterly_mean <- function(df, value_col, out_name) {
+  df %>%
+    mutate(quarter = floor_date(observation_date, "quarter")) %>%
+    group_by(quarter) %>%
+    summarise(value = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    rename(!!out_name := value) %>%
+    filter(quarter >= min_q, quarter <= max_q)
+}
+
+dc_spending_q <- to_quarterly_mean(data_center_spending, "dc_spending", "dc_spending")
+tcu_q <- to_quarterly_mean(tcu_clean, "tcu", "tcu")
+utility_q <- to_quarterly_mean(electricity_clean, "utility_production", "utility_production")
+
+pce_q <- pce_clean %>%
+  mutate(quarter = floor_date(observation_date, "quarter")) %>%
+  group_by(quarter) %>%
+  summarise(pce_deflator = mean(pce_deflator, na.rm = TRUE), .groups = "drop") %>%
+  filter(quarter >= min_q, quarter <= max_q)
+```
+
+```{r}
+# CHUNK 12 — Build Data Center Quarterly Internal Dataset
+
+data_center_quarterly <- baseline_quarterly_complete %>%
+  filter(project_type == "DATA CENTER") %>%
+  select(quarter, labor_hours, job_starts) %>%
+  arrange(quarter)
+
+data_center_quarterly
+```
+
+```{r}
+# CHUNK 13 — Merge Quarterly External Indicators
+
+external_indicators_q <- dc_spending_q %>%
+  full_join(tcu_q, by = "quarter") %>%
+  full_join(utility_q, by = "quarter") %>%
+  full_join(pce_q, by = "quarter") %>%
+  arrange(quarter)
+
+external_indicators_q
+```
+
+```{r}
+# CHUNK 14 — Quick Visual Check of External Indicators
+
+external_indicators_long <- external_indicators_q %>%
+  pivot_longer(
+    cols = -quarter,
+    names_to = "indicator",
+    values_to = "value"
+  )
+
+ggplot(external_indicators_long, aes(x = quarter, y = value, color = indicator)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ indicator, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Quarterly External Indicators",
+    x = "Quarter",
+    y = "Value",
+    color = "Indicator"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```markdown
+## External Indicator Design
+
+We selected external indicators to better reflect the economic and infrastructure conditions that may influence data-center-related construction activity. These indicators were converted to quarterly frequency to align with Lithko’s internal reporting cadence. Because the goal is directional planning support rather than exact causal attribution, the indicators are evaluated as potential leading signals to test whether they improve forecast accuracy relative to an internal-only baseline.
+```
+
+```{r}
+# CHUNK 15 — Build Data Center Modeling Table
+
+dc_model_data <- data_center_quarterly %>%
+  left_join(dc_spending_q, by = "quarter") %>%
+  left_join(pce_q, by = "quarter") %>%
+  left_join(tcu_q, by = "quarter") %>%
+  left_join(utility_q, by = "quarter") %>%
+  arrange(quarter)
+
+glimpse(dc_model_data)
+head(dc_model_data)
+```
+
+```{r}
+# CHUNK 16 — Create Lagged Versions of Internal and External Variables
+
+dc_model_data <- dc_model_data %>%
+  arrange(quarter) %>%
+  mutate(
+    qtr = factor(
+      paste0("Q", lubridate::quarter(quarter)),
+      levels = c("Q1", "Q2", "Q3", "Q4")
+    ),
+
+    labor_hours_lag1 = lag(labor_hours, 1),
+    labor_hours_lag2 = lag(labor_hours, 2),
+    labor_hours_lag3 = lag(labor_hours, 3),
+    labor_hours_lag4 = lag(labor_hours, 4),
+
+    dc_spending_lag1 = lag(dc_spending, 1),
+    dc_spending_lag2 = lag(dc_spending, 2),
+    dc_spending_lag3 = lag(dc_spending, 3),
+    dc_spending_lag4 = lag(dc_spending, 4),
+
+    pce_deflator_lag1 = lag(pce_deflator, 1),
+    pce_deflator_lag2 = lag(pce_deflator, 2),
+    pce_deflator_lag3 = lag(pce_deflator, 3),
+    pce_deflator_lag4 = lag(pce_deflator, 4),
+
+    tcu_lag1 = lag(tcu, 1),
+    tcu_lag2 = lag(tcu, 2),
+    tcu_lag3 = lag(tcu, 3),
+    tcu_lag4 = lag(tcu, 4),
+
+    utility_production_lag1 = lag(utility_production, 1),
+    utility_production_lag2 = lag(utility_production, 2),
+    utility_production_lag3 = lag(utility_production, 3),
+    utility_production_lag4 = lag(utility_production, 4)
+  )
+
+glimpse(dc_model_data)
+```
+
+```{r}
+# CHUNK 17 — Create Horizon-Specific Forecasting Function
+# Uses calculate_error_metrics() defined in CHUNK 1b.
+
+fit_dc_horizon_models <- function(data, horizon, test_periods = 4) {
+
+  horizon_data <- data %>%
+    transmute(
+      quarter,
+      qtr,
+      labor_hours,
+      labor_hours_lag = .data[[paste0("labor_hours_lag", horizon)]],
+      dc_spending_lag = .data[[paste0("dc_spending_lag", horizon)]],
+      pce_deflator_lag = .data[[paste0("pce_deflator_lag", horizon)]],
+      tcu_lag = .data[[paste0("tcu_lag", horizon)]],
+      utility_production_lag = .data[[paste0("utility_production_lag", horizon)]]
+    ) %>%
+    drop_na()
+
+  n_obs <- nrow(horizon_data)
+
+  if (n_obs < 8) {
+    stop(paste("Not enough observations available for horizon", horizon))
+  }
+
+  test_n <- min(test_periods, max(2, floor(n_obs * 0.25)))
+  train_n <- n_obs - test_n
+
+  train_data <- horizon_data %>%
+    slice(1:train_n)
+
+  test_data <- horizon_data %>%
+    slice((train_n + 1):n_obs)
+
+  baseline_model <- lm(
+    labor_hours ~ labor_hours_lag + qtr,
+    data = train_data
+  )
+
+  augmented_model <- lm(
+    labor_hours ~ labor_hours_lag +
+      I(dc_spending_lag / 100000000) +
+      pce_deflator_lag +
+      tcu_lag +
+      utility_production_lag +
+      qtr,
+    data = train_data
+  )
+
+  test_predictions <- test_data %>%
+    mutate(
+      baseline_forecast = predict(baseline_model, newdata = test_data),
+      augmented_forecast = predict(augmented_model, newdata = test_data)
+    )
+
+  baseline_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$baseline_forecast
+  )
+
+  augmented_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$augmented_forecast
+  )
+
+  list(
+    horizon = horizon,
+    horizon_data = horizon_data,
+    train_data = train_data,
+    test_data = test_data,
+    baseline_model = baseline_model,
+    augmented_model = augmented_model,
+    predictions = test_predictions,
+    baseline_metrics = baseline_metrics,
+    augmented_metrics = augmented_metrics
+  )
+}
+```
+
+```{r}
+# CHUNK 18 — Run True 1Q, 2Q, 3Q, and 4Q Ahead Models
+
+dc_horizon_results <- list(
+  `1Q Ahead` = fit_dc_horizon_models(dc_model_data, horizon = 1),
+  `2Q Ahead` = fit_dc_horizon_models(dc_model_data, horizon = 2),
+  `3Q Ahead` = fit_dc_horizon_models(dc_model_data, horizon = 3),
+  `4Q Ahead` = fit_dc_horizon_models(dc_model_data, horizon = 4)
+)
+
+names(dc_horizon_results)
+```
+
+```{r}
+# CHUNK 19 — Forecast Error Summary Table
+
+dc_forecast_error_summary <- bind_rows(
+  lapply(names(dc_horizon_results), function(h_name) {
+    result <- dc_horizon_results[[h_name]]
+
+    tibble(
+      segment = "Data Center",
+      forecast_horizon = h_name,
+      baseline_MAE = result$baseline_metrics$MAE,
+      enhanced_MAE = result$augmented_metrics$MAE,
+      baseline_MAPE = result$baseline_metrics$MAPE,
+      enhanced_MAPE = result$augmented_metrics$MAPE,
+      baseline_RMSE = result$baseline_metrics$RMSE,
+      enhanced_RMSE = result$augmented_metrics$RMSE
+    )
+  })
+) %>%
+  mutate(
+    MAE_lift_pct = ((baseline_MAE - enhanced_MAE) / baseline_MAE) * 100,
+    MAPE_lift_pct = ((baseline_MAPE - enhanced_MAPE) / baseline_MAPE) * 100,
+    RMSE_lift_pct = ((baseline_RMSE - enhanced_RMSE) / baseline_RMSE) * 100
+  )
+
+dc_forecast_error_summary %>%
+  mutate(
+    across(
+      c(
+        baseline_MAE, enhanced_MAE,
+        baseline_RMSE, enhanced_RMSE
+      ),
+      ~ comma(round(.))
+    ),
+    across(
+      c(
+        baseline_MAPE, enhanced_MAPE,
+        MAE_lift_pct, MAPE_lift_pct, RMSE_lift_pct
+      ),
+      ~ percent(. / 100, accuracy = 0.1)
+    )
+  ) %>%
+  kable(
+    caption = "Data Center Forecast Error Summary by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 20 — Lift in Accuracy Summary Table
+
+dc_lift_summary <- dc_forecast_error_summary %>%
+  select(
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE,
+    RMSE_lift_pct,
+    baseline_MAE,
+    enhanced_MAE,
+    MAE_lift_pct
+  )
+
+dc_lift_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Data Center Lift in Accuracy from External Indicators"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 21 — One Coefficient Table Per Regression
+
+# 1Q Ahead
+dc_1q_result <- dc_horizon_results[["1Q Ahead"]]
+
+tidy(dc_1q_result$baseline_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 1Q Ahead — Baseline Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+tidy(dc_1q_result$augmented_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 1Q Ahead — Augmented Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+
+# 2Q Ahead
+dc_2q_result <- dc_horizon_results[["2Q Ahead"]]
+
+tidy(dc_2q_result$baseline_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 2Q Ahead — Baseline Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+tidy(dc_2q_result$augmented_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 2Q Ahead — Augmented Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+
+# 3Q Ahead
+dc_3q_result <- dc_horizon_results[["3Q Ahead"]]
+
+tidy(dc_3q_result$baseline_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 3Q Ahead — Baseline Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+tidy(dc_3q_result$augmented_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 3Q Ahead — Augmented Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+
+# 4Q Ahead
+dc_4q_result <- dc_horizon_results[["4Q Ahead"]]
+
+tidy(dc_4q_result$baseline_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 4Q Ahead — Baseline Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+tidy(dc_4q_result$augmented_model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 3),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(caption = "Data Center 4Q Ahead — Augmented Coefficients") %>%
+  kable_styling(full_width = FALSE)
+
+dc_coefficients_by_horizon <- bind_rows(
+  tidy(dc_1q_result$baseline_model) %>%
+    mutate(model_type = "Baseline", forecast_horizon = "1Q Ahead"),
+  tidy(dc_1q_result$augmented_model) %>%
+    mutate(model_type = "Augmented", forecast_horizon = "1Q Ahead"),
+
+  tidy(dc_2q_result$baseline_model) %>%
+    mutate(model_type = "Baseline", forecast_horizon = "2Q Ahead"),
+  tidy(dc_2q_result$augmented_model) %>%
+    mutate(model_type = "Augmented", forecast_horizon = "2Q Ahead"),
+
+  tidy(dc_3q_result$baseline_model) %>%
+    mutate(model_type = "Baseline", forecast_horizon = "3Q Ahead"),
+  tidy(dc_3q_result$augmented_model) %>%
+    mutate(model_type = "Augmented", forecast_horizon = "3Q Ahead"),
+
+  tidy(dc_4q_result$baseline_model) %>%
+    mutate(model_type = "Baseline", forecast_horizon = "4Q Ahead"),
+  tidy(dc_4q_result$augmented_model) %>%
+    mutate(model_type = "Augmented", forecast_horizon = "4Q Ahead")
+) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+```
+
+```{r}
+# CHUNK 22 — Indicators Tested Summary by Horizon
+
+dc_indicator_tested_summary <- dc_coefficients_by_horizon %>%
+  filter(
+    model_type == "Augmented",
+    !term %in% c("(Intercept)", "labor_hours_lag"),
+    !str_detect(term, "^qtr")
+  ) %>%
+  mutate(
+    indicator = case_when(
+      term == "I(dc_spending_lag/1e+08)" ~ "dc_spending_lag",
+      TRUE ~ term
+    ),
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    ),
+    included_in_final_model = if_else(p.value < 0.10, "Yes", "No")
+  ) %>%
+  select(
+    forecast_horizon,
+    indicator,
+    estimate,
+    p.value,
+    significance,
+    direction,
+    included_in_final_model
+  )
+
+dc_indicator_tested_summary %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Data Center Indicators Tested by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 23 — RMSE Comparison Plot by Horizon
+
+dc_rmse_plot_data <- dc_forecast_error_summary %>%
+  select(
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE
+  ) %>%
+  pivot_longer(
+    cols = c(baseline_RMSE, enhanced_RMSE),
+    names_to = "model_type",
+    values_to = "RMSE"
+  ) %>%
+  mutate(
+    model_type = recode(
+      model_type,
+      baseline_RMSE = "Baseline",
+      enhanced_RMSE = "Enhanced"
+    ),
+    forecast_horizon = factor(
+      forecast_horizon,
+      levels = c("1Q Ahead", "2Q Ahead", "3Q Ahead", "4Q Ahead")
+    )
+  )
+
+ggplot(dc_rmse_plot_data, aes(x = forecast_horizon, y = RMSE, fill = model_type)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Data Center RMSE by Forecast Horizon",
+    subtitle = "Baseline vs Enhanced Models",
+    x = "Forecast Horizon",
+    y = "RMSE",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 24 — Actual vs Predicted Plot for 3Q Ahead Test Period
+
+dc_3q_plot_data <- dc_horizon_results[["3Q Ahead"]]$predictions %>%
+  select(quarter, labor_hours, baseline_forecast, augmented_forecast) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_forecast, augmented_forecast),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_forecast = "Baseline Forecast",
+      augmented_forecast = "Enhanced Forecast"
+    )
+  )
+
+ggplot(dc_3q_plot_data, aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Data Center 3Q Ahead Forecast: Actual vs Predicted",
+    subtitle = "Test Period Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 25 — Load Warehouse External Indicators
+
+ecom_raw <- read_csv("E-Commerce Retail Sales.csv", show_col_types = FALSE) %>%
+  clean_names()
+
+pnfi_raw <- read_excel("Private_Nonresidential_Fixed_Investment.xlsx", sheet = "Quarterly") %>%
+  clean_names()
+
+tlnrescons_raw <- read_excel("Total Construction Spending-Nonresidential in the United States .xlsx", sheet = "Monthly") %>%
+  clean_names()
+
+indpro_raw <- read_excel("INDPRO(manufacturing).xlsx", sheet = "Monthly") %>%
+  clean_names()
+
+dgs10_raw <- read_excel("Interest_Rate_10Y.xlsx", sheet = "Daily") %>%
+  clean_names()
+```
+
+```{r}
+# CHUNK 26 — Clean Warehouse External Indicators
+
+ecom_clean <- ecom_raw %>%
+  rename(
+    observation_date = observation_date,
+    ecom_sales = e_commerce_retail_sales
+  ) %>%
+  mutate(
+    observation_date = mdy(observation_date)
+  ) %>%
+  select(observation_date, ecom_sales)
+
+pnfi_clean <- pnfi_raw %>%
+  rename(
+    observation_date = observation_date,
+    pnfi = private_nonresidential_fixed_investment
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, pnfi)
+
+tlnrescons_clean <- tlnrescons_raw %>%
+  rename(
+    observation_date = observation_date,
+    tlnrescons = tlnrescons
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, tlnrescons)
+
+indpro_clean <- indpro_raw %>%
+  rename(
+    observation_date = observation_date,
+    indpro = industrial_pro
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, indpro)
+
+dgs10_clean <- dgs10_raw %>%
+  rename(
+    observation_date = observation_date,
+    dgs10 = interest_rate_10y
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, dgs10)
+
+ecom_clean
+pnfi_clean
+tlnrescons_clean
+indpro_clean
+dgs10_clean
+```
+
+```{r}
+# CHUNK 27 — Convert Warehouse External Indicators to Quarterly Frequency
+# Reuses to_quarterly_mean() defined in CHUNK 11.
+
+ecom_q <- to_quarterly_mean(ecom_clean, "ecom_sales", "ecom_sales")
+pnfi_q <- to_quarterly_mean(pnfi_clean, "pnfi", "pnfi")
+tlnrescons_q <- to_quarterly_mean(tlnrescons_clean, "tlnrescons", "tlnrescons")
+indpro_q <- to_quarterly_mean(indpro_clean, "indpro", "indpro")
+dgs10_q <- to_quarterly_mean(dgs10_clean, "dgs10", "dgs10")
+
+ecom_q
+pnfi_q
+tlnrescons_q
+indpro_q
+dgs10_q
+```
+
+```{r}
+# CHUNK 28 — Build Warehouse Quarterly Internal Dataset
+
+warehouse_quarterly <- baseline_quarterly_complete %>%
+  filter(project_type == "WAREHOUSE") %>%
+  select(quarter, labor_hours, job_starts) %>%
+  arrange(quarter)
+
+warehouse_quarterly
+```
+
+```{r}
+# CHUNK 29 — Merge Warehouse Quarterly External Indicators
+
+warehouse_external_indicators_q <- ecom_q %>%
+  full_join(pnfi_q, by = "quarter") %>%
+  full_join(tlnrescons_q, by = "quarter") %>%
+  full_join(indpro_q, by = "quarter") %>%
+  full_join(dgs10_q, by = "quarter") %>%
+  arrange(quarter)
+
+warehouse_external_indicators_q
+```
+
+```{r}
+# CHUNK 30 — Quick Visual Check of Warehouse External Indicators
+
+warehouse_external_long <- warehouse_external_indicators_q %>%
+  pivot_longer(
+    cols = -quarter,
+    names_to = "indicator",
+    values_to = "value"
+  )
+
+ggplot(warehouse_external_long, aes(x = quarter, y = value, color = indicator)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ indicator, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Quarterly Warehouse External Indicators",
+    x = "Quarter",
+    y = "Value",
+    color = "Indicator"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 31 — Build Warehouse Modeling Table
+
+warehouse_model_data <- warehouse_quarterly %>%
+  left_join(ecom_q, by = "quarter") %>%
+  left_join(pnfi_q, by = "quarter") %>%
+  left_join(tlnrescons_q, by = "quarter") %>%
+  left_join(indpro_q, by = "quarter") %>%
+  left_join(dgs10_q, by = "quarter") %>%
+  arrange(quarter)
+
+glimpse(warehouse_model_data)
+head(warehouse_model_data)
+```
+
+```{r}
+# CHUNK 32 — Create Lagged Versions of Internal and External Variables
+
+warehouse_model_data <- warehouse_model_data %>%
+  arrange(quarter) %>%
+  mutate(
+    qtr = factor(
+      paste0("Q", lubridate::quarter(quarter)),
+      levels = c("Q1", "Q2", "Q3", "Q4")
+    ),
+
+    labor_hours_lag1 = lag(labor_hours, 1),
+    labor_hours_lag2 = lag(labor_hours, 2),
+    labor_hours_lag3 = lag(labor_hours, 3),
+    labor_hours_lag4 = lag(labor_hours, 4),
+
+    ecom_lag1 = lag(ecom_sales, 1),
+    ecom_lag2 = lag(ecom_sales, 2),
+    ecom_lag3 = lag(ecom_sales, 3),
+    ecom_lag4 = lag(ecom_sales, 4),
+
+    pnfi_lag1 = lag(pnfi, 1),
+    pnfi_lag2 = lag(pnfi, 2),
+    pnfi_lag3 = lag(pnfi, 3),
+    pnfi_lag4 = lag(pnfi, 4),
+
+    tlnrescons_lag1 = lag(tlnrescons, 1),
+    tlnrescons_lag2 = lag(tlnrescons, 2),
+    tlnrescons_lag3 = lag(tlnrescons, 3),
+    tlnrescons_lag4 = lag(tlnrescons, 4),
+
+    indpro_lag1 = lag(indpro, 1),
+    indpro_lag2 = lag(indpro, 2),
+    indpro_lag3 = lag(indpro, 3),
+    indpro_lag4 = lag(indpro, 4),
+
+    dgs10_lag1 = lag(dgs10, 1),
+    dgs10_lag2 = lag(dgs10, 2),
+    dgs10_lag3 = lag(dgs10, 3),
+    dgs10_lag4 = lag(dgs10, 4)
+  )
+
+glimpse(warehouse_model_data)
+```
+
+```{r}
+# CHUNK 33 — Create Horizon-Specific Forecasting Function for Warehouse
+
+fit_warehouse_horizon_models <- function(data, horizon, test_periods = 4) {
+
+  horizon_data <- data %>%
+    transmute(
+      quarter,
+      qtr,
+      labor_hours,
+      labor_hours_lag = .data[[paste0("labor_hours_lag", horizon)]],
+      ecom_lag = .data[[paste0("ecom_lag", horizon)]],
+      pnfi_lag = .data[[paste0("pnfi_lag", horizon)]],
+      tlnrescons_lag = .data[[paste0("tlnrescons_lag", horizon)]],
+      indpro_lag = .data[[paste0("indpro_lag", horizon)]],
+      dgs10_lag = .data[[paste0("dgs10_lag", horizon)]]
+    ) %>%
+    drop_na()
+
+  n_obs <- nrow(horizon_data)
+
+  if (n_obs < 8) {
+    stop(paste("Not enough observations available for horizon", horizon))
+  }
+
+  test_n <- min(test_periods, max(2, floor(n_obs * 0.25)))
+  train_n <- n_obs - test_n
+
+  train_data <- horizon_data %>%
+    slice(1:train_n)
+
+  test_data <- horizon_data %>%
+    slice((train_n + 1):n_obs)
+
+  baseline_model <- lm(
+    labor_hours ~ labor_hours_lag + qtr,
+    data = train_data
+  )
+
+  augmented_model <- lm(
+    labor_hours ~ labor_hours_lag +
+      ecom_lag +
+      pnfi_lag +
+      tlnrescons_lag +
+      indpro_lag +
+      dgs10_lag +
+      qtr,
+    data = train_data
+  )
+
+  test_predictions <- test_data %>%
+    mutate(
+      baseline_forecast = predict(baseline_model, newdata = test_data),
+      augmented_forecast = predict(augmented_model, newdata = test_data)
+    )
+
+  baseline_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$baseline_forecast
+  )
+
+  augmented_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$augmented_forecast
+  )
+
+  list(
+    horizon = horizon,
+    horizon_data = horizon_data,
+    train_data = train_data,
+    test_data = test_data,
+    baseline_model = baseline_model,
+    augmented_model = augmented_model,
+    predictions = test_predictions,
+    baseline_metrics = baseline_metrics,
+    augmented_metrics = augmented_metrics
+  )
+}
+```
+
+```{r}
+# CHUNK 34 — Run True 1Q, 2Q, 3Q, and 4Q Ahead Warehouse Models
+
+warehouse_horizon_results <- list(
+  `1Q Ahead` = fit_warehouse_horizon_models(warehouse_model_data, horizon = 1),
+  `2Q Ahead` = fit_warehouse_horizon_models(warehouse_model_data, horizon = 2),
+  `3Q Ahead` = fit_warehouse_horizon_models(warehouse_model_data, horizon = 3),
+  `4Q Ahead` = fit_warehouse_horizon_models(warehouse_model_data, horizon = 4)
+)
+
+names(warehouse_horizon_results)
+```
+
+```{r}
+# CHUNK 35 — Warehouse Forecast Error Summary Table
+
+warehouse_forecast_error_summary <- bind_rows(
+  lapply(names(warehouse_horizon_results), function(h_name) {
+    result <- warehouse_horizon_results[[h_name]]
+
+    tibble(
+      segment = "Warehouse",
+      forecast_horizon = h_name,
+      baseline_MAE = result$baseline_metrics$MAE,
+      enhanced_MAE = result$augmented_metrics$MAE,
+      baseline_MAPE = result$baseline_metrics$MAPE,
+      enhanced_MAPE = result$augmented_metrics$MAPE,
+      baseline_RMSE = result$baseline_metrics$RMSE,
+      enhanced_RMSE = result$augmented_metrics$RMSE
+    )
+  })
+) %>%
+  mutate(
+    MAE_lift_pct = ((baseline_MAE - enhanced_MAE) / baseline_MAE) * 100,
+    MAPE_lift_pct = ((baseline_MAPE - enhanced_MAPE) / baseline_MAPE) * 100,
+    RMSE_lift_pct = ((baseline_RMSE - enhanced_RMSE) / baseline_RMSE) * 100
+  )
+
+warehouse_forecast_error_summary %>%
+  mutate(
+    across(
+      c(
+        baseline_MAE, enhanced_MAE,
+        baseline_RMSE, enhanced_RMSE
+      ),
+      ~ comma(round(.))
+    ),
+    across(
+      c(
+        baseline_MAPE, enhanced_MAPE,
+        MAE_lift_pct, MAPE_lift_pct, RMSE_lift_pct
+      ),
+      ~ percent(. / 100, accuracy = 0.1)
+    )
+  ) %>%
+  kable(
+    caption = "Warehouse Forecast Error Summary by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 36 — Warehouse Lift in Accuracy Summary Table
+
+warehouse_lift_summary <- warehouse_forecast_error_summary %>%
+  select(
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE,
+    RMSE_lift_pct,
+    baseline_MAE,
+    enhanced_MAE,
+    MAE_lift_pct
+  )
+
+warehouse_lift_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Warehouse Lift in Accuracy from External Indicators"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 37 — Warehouse Baseline and Augmented Coefficients by Horizon
+
+warehouse_coefficients_by_horizon <- bind_rows(
+  lapply(names(warehouse_horizon_results), function(h_name) {
+    result <- warehouse_horizon_results[[h_name]]
+
+    baseline_tidy <- tidy(result$baseline_model) %>%
+      mutate(
+        model_type = "Baseline",
+        forecast_horizon = h_name
+      )
+
+    augmented_tidy <- tidy(result$augmented_model) %>%
+      mutate(
+        model_type = "Augmented",
+        forecast_horizon = h_name
+      )
+
+    bind_rows(baseline_tidy, augmented_tidy)
+  })
+) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+warehouse_coefficients_by_horizon %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Warehouse Regression Coefficients by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 38 — Warehouse Indicators Tested Summary by Horizon
+
+warehouse_indicator_tested_summary <- warehouse_coefficients_by_horizon %>%
+  filter(
+    model_type == "Augmented",
+    !term %in% c("(Intercept)", "labor_hours_lag"),
+    !str_detect(term, "^qtr")
+  ) %>%
+  mutate(
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    ),
+    included_in_final_model = if_else(p.value < 0.10, "Yes", "No")
+  ) %>%
+  select(
+    forecast_horizon,
+    indicator = term,
+    estimate,
+    p.value,
+    significance,
+    direction,
+    included_in_final_model
+  )
+
+warehouse_indicator_tested_summary %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Warehouse Indicators Tested by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 39 — Warehouse RMSE Comparison Plot by Horizon
+
+warehouse_rmse_plot_data <- warehouse_forecast_error_summary %>%
+  select(
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE
+  ) %>%
+  pivot_longer(
+    cols = c(baseline_RMSE, enhanced_RMSE),
+    names_to = "model_type",
+    values_to = "RMSE"
+  ) %>%
+  mutate(
+    model_type = recode(
+      model_type,
+      baseline_RMSE = "Baseline",
+      enhanced_RMSE = "Enhanced"
+    ),
+    forecast_horizon = factor(
+      forecast_horizon,
+      levels = c("1Q Ahead", "2Q Ahead", "3Q Ahead", "4Q Ahead")
+    )
+  )
+
+ggplot(warehouse_rmse_plot_data, aes(x = forecast_horizon, y = RMSE, fill = model_type)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Warehouse RMSE by Forecast Horizon",
+    subtitle = "Baseline vs Enhanced Models",
+    x = "Forecast Horizon",
+    y = "RMSE",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 40 — Warehouse Actual vs Predicted Plot for 4Q Ahead
+
+warehouse_plot_data <- warehouse_horizon_results[["4Q Ahead"]]$predictions %>%
+  select(quarter, labor_hours, baseline_forecast, augmented_forecast) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_forecast, augmented_forecast),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_forecast = "Baseline Forecast",
+      augmented_forecast = "Enhanced Forecast"
+    )
+  )
+
+ggplot(warehouse_plot_data, aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Warehouse 4Q Ahead Forecast: Actual vs Predicted",
+    subtitle = "Test Period Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 41 — Combine Data Center and Warehouse Forecast Error Results
+
+combined_forecast_summary <- bind_rows(
+  dc_forecast_error_summary,
+  warehouse_forecast_error_summary
+) %>%
+  select(
+    segment,
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE,
+    RMSE_lift_pct,
+    baseline_MAE,
+    enhanced_MAE,
+    MAE_lift_pct
+  ) %>%
+  mutate(
+    forecast_horizon = factor(
+      forecast_horizon,
+      levels = c("1Q Ahead", "2Q Ahead", "3Q Ahead", "4Q Ahead")
+    ),
+    segment = factor(
+      segment,
+      levels = c("Data Center", "Warehouse")
+    )
+  )
+
+combined_forecast_summary
+```
+
+```{r}
+# CHUNK 42 — Combined RMSE Lift Table for Data Center vs Warehouse
+
+combined_forecast_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  arrange(segment, forecast_horizon) %>%
+  kable(
+    caption = "Forecast Accuracy Improvement by Segment and Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 43 — RMSE Lift Comparison Plot Across Segments and Horizons
+
+combined_rmse_plot_data <- combined_forecast_summary %>%
+  select(segment, forecast_horizon, RMSE_lift_pct)
+
+ggplot(combined_rmse_plot_data,
+       aes(x = forecast_horizon, y = RMSE_lift_pct, fill = segment)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(labels = function(x) paste0(round(x), "%")) +
+  labs(
+    title = "RMSE Improvement from External Indicators",
+    subtitle = "Comparison Across Segments and Forecast Horizons",
+    x = "Forecast Horizon",
+    y = "RMSE Lift %",
+    fill = "Segment"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 44 — Best Forecast Horizon by Segment
+
+best_horizon_summary <- combined_forecast_summary %>%
+  group_by(segment) %>%
+  slice_max(RMSE_lift_pct, n = 1) %>%
+  ungroup()
+
+best_horizon_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Best Forecast Horizon by Segment"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 45 — Final Business Takeaway Table
+
+final_business_takeaway <- tibble(
+  segment = c("Data Center", "Warehouse"),
+  preferred_horizon = c("3Q Ahead", "4Q Ahead"),
+  key_indicator_story = c(
+    "Technology investment and data center construction indicators showed the strongest signal approximately 3 quarters ahead.",
+    "Warehouse demand showed the strongest longer-term signal approximately 4 quarters ahead, with interest rates becoming more important at longer horizons."
+  ),
+  business_takeaway = c(
+    "Lithko may be able to identify rising data center demand roughly 3 quarters before labor demand accelerates.",
+    "Lithko may be able to identify warehouse demand shifts roughly 4 quarters in advance using external macro indicators."
+  )
+)
+
+final_business_takeaway %>%
+  kable(
+    caption = "Final Business Takeaways by Segment"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 46 — Business-Preferred Horizon Summary
+
+business_preferred_horizon <- tibble(
+  segment = c("Data Center", "Warehouse"),
+  preferred_horizon = c("3Q Ahead", "4Q Ahead")
+) %>%
+  left_join(
+    combined_forecast_summary,
+    by = c("segment", "preferred_horizon" = "forecast_horizon")
+  )
+
+business_preferred_horizon %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Business-Preferred Forecast Horizon by Segment"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 47 — Combined Indicator Story Table
+
+data_center_indicator_story <- dc_indicator_tested_summary %>%
+  mutate(segment = "Data Center")
+
+warehouse_indicator_story <- warehouse_indicator_tested_summary %>%
+  mutate(segment = "Warehouse")
+
+combined_indicator_story <- bind_rows(
+  data_center_indicator_story,
+  warehouse_indicator_story
+) %>%
+  select(
+    segment,
+    forecast_horizon,
+    indicator,
+    estimate,
+    p.value,
+    significance,
+    direction,
+    included_in_final_model
+  )
+
+combined_indicator_story %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Combined Indicator Testing Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 48 — Full-Timeline Data Center Baseline Validation
+
+dc_full_baseline_data <- dc_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    labor_hours,
+    labor_hours_lag1,
+    labor_hours_lag2
+  ) %>%
+  drop_na()
+
+dc_full_baseline_model <- lm(
+  labor_hours ~ labor_hours_lag1 + labor_hours_lag2 + qtr,
+  data = dc_full_baseline_data
+)
+
+dc_full_baseline_data <- dc_full_baseline_data %>%
+  mutate(
+    baseline_fitted = predict(dc_full_baseline_model, newdata = dc_full_baseline_data)
+  )
+
+dc_full_baseline_data %>%
+  select(quarter, labor_hours, baseline_fitted)
+```
+
+```{r}
+# CHUNK 49 — Full-Timeline Data Center Actual vs Baseline Plot
+
+dc_full_baseline_plot_data <- dc_full_baseline_data %>%
+  select(quarter, labor_hours, baseline_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted"
+    )
+  )
+
+ggplot(dc_full_baseline_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Data Center Full-Timeline Actual vs Baseline",
+    subtitle = "Baseline validation over the full available timeline",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 50 — Full-Timeline Warehouse Baseline Validation
+
+warehouse_full_baseline_data <- warehouse_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    labor_hours,
+    labor_hours_lag1,
+    labor_hours_lag2
+  ) %>%
+  drop_na()
+
+warehouse_full_baseline_model <- lm(
+  labor_hours ~ labor_hours_lag1 + labor_hours_lag2 + qtr,
+  data = warehouse_full_baseline_data
+)
+
+warehouse_full_baseline_data <- warehouse_full_baseline_data %>%
+  mutate(
+    baseline_fitted = predict(warehouse_full_baseline_model, newdata = warehouse_full_baseline_data)
+  )
+
+warehouse_full_baseline_data %>%
+  select(quarter, labor_hours, baseline_fitted)
+```
+
+```{r}
+# CHUNK 51 — Full-Timeline Warehouse Actual vs Baseline Plot
+
+warehouse_full_baseline_plot_data <- warehouse_full_baseline_data %>%
+  select(quarter, labor_hours, baseline_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted"
+    )
+  )
+
+ggplot(warehouse_full_baseline_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Warehouse Full-Timeline Actual vs Baseline",
+    subtitle = "Baseline validation over the full available timeline",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 52 — Baseline Bias Summary Table
+
+baseline_bias_summary <- bind_rows(
+  dc_full_baseline_data %>%
+    summarise(
+      segment = "Data Center",
+      mean_actual = mean(labor_hours, na.rm = TRUE),
+      mean_baseline = mean(baseline_fitted, na.rm = TRUE),
+      mean_error = mean(baseline_fitted - labor_hours, na.rm = TRUE),
+      mean_abs_error = mean(abs(baseline_fitted - labor_hours), na.rm = TRUE)
+    ),
+  warehouse_full_baseline_data %>%
+    summarise(
+      segment = "Warehouse",
+      mean_actual = mean(labor_hours, na.rm = TRUE),
+      mean_baseline = mean(baseline_fitted, na.rm = TRUE),
+      mean_error = mean(baseline_fitted - labor_hours, na.rm = TRUE),
+      mean_abs_error = mean(abs(baseline_fitted - labor_hours), na.rm = TRUE)
+    )
+)
+
+baseline_bias_summary %>%
+  mutate(
+    across(
+      c(mean_actual, mean_baseline, mean_error, mean_abs_error),
+      ~ comma(round(.))
+    )
+  ) %>%
+  kable(
+    caption = "Baseline Bias Check by Segment"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 53 — Full-Timeline Data Center Actual vs Baseline vs Enhanced
+
+dc_full_enhanced_data <- dc_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    labor_hours,
+    labor_hours_lag1,
+    labor_hours_lag2,
+    dc_spending_lag1,
+    pce_deflator_lag1,
+    tcu_lag1,
+    utility_production_lag1
+  ) %>%
+  drop_na()
+
+dc_full_baseline_model_1q <- lm(
+  labor_hours ~ labor_hours_lag1 + labor_hours_lag2 + qtr,
+  data = dc_full_enhanced_data
+)
+
+dc_full_enhanced_model_1q <- lm(
+  labor_hours ~ labor_hours_lag1 + labor_hours_lag2 +
+    I(dc_spending_lag1 / 100000000) +
+    pce_deflator_lag1 +
+    tcu_lag1 +
+    utility_production_lag1 +
+    qtr,
+  data = dc_full_enhanced_data
+)
+
+dc_full_enhanced_data <- dc_full_enhanced_data %>%
+  mutate(
+    baseline_fitted = predict(dc_full_baseline_model_1q, newdata = dc_full_enhanced_data),
+    enhanced_fitted = predict(dc_full_enhanced_model_1q, newdata = dc_full_enhanced_data)
+  )
+
+dc_full_enhanced_plot_data <- dc_full_enhanced_data %>%
+  select(quarter, labor_hours, baseline_fitted, enhanced_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted, enhanced_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted",
+      enhanced_fitted = "Enhanced Fitted"
+    )
+  )
+
+ggplot(dc_full_enhanced_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Data Center Full-Timeline Actual vs Baseline vs Enhanced",
+    subtitle = "Validation over the full available timeline",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 54 — Full-Timeline Warehouse Actual vs Baseline vs Enhanced
+
+warehouse_full_enhanced_data <- warehouse_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    labor_hours,
+    labor_hours_lag1,
+    labor_hours_lag2,
+    ecom_lag1,
+    pnfi_lag1,
+    tlnrescons_lag1,
+    indpro_lag1,
+    dgs10_lag1
+  ) %>%
+  drop_na()
+
+warehouse_full_baseline_model_1q <- lm(
+  labor_hours ~ labor_hours_lag1 + labor_hours_lag2 + qtr,
+  data = warehouse_full_enhanced_data
+)
+
+warehouse_full_enhanced_model_1q <- lm(
+  labor_hours ~ labor_hours_lag1 + labor_hours_lag2 +
+    ecom_lag1 +
+    pnfi_lag1 +
+    tlnrescons_lag1 +
+    indpro_lag1 +
+    dgs10_lag1 +
+    qtr,
+  data = warehouse_full_enhanced_data
+)
+
+warehouse_full_enhanced_data <- warehouse_full_enhanced_data %>%
+  mutate(
+    baseline_fitted = predict(warehouse_full_baseline_model_1q, newdata = warehouse_full_enhanced_data),
+    enhanced_fitted = predict(warehouse_full_enhanced_model_1q, newdata = warehouse_full_enhanced_data)
+  )
+
+warehouse_full_enhanced_plot_data <- warehouse_full_enhanced_data %>%
+  select(quarter, labor_hours, baseline_fitted, enhanced_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted, enhanced_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted",
+      enhanced_fitted = "Enhanced Fitted"
+    )
+  )
+
+ggplot(warehouse_full_enhanced_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Warehouse Full-Timeline Actual vs Baseline vs Enhanced",
+    subtitle = "Validation over the full available timeline",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK 55 — Data Center Final Sector Summary Table
+
+dc_rsq_table <- tibble(
+  baseline_r_squared = summary(dc_horizon_results[["3Q Ahead"]]$baseline_model)$r.squared,
+  enhanced_r_squared = summary(dc_horizon_results[["3Q Ahead"]]$augmented_model)$r.squared
+)
+
+data_center_final_summary <- tibble(
+  segment = "Data Center",
+  preferred_horizon = "3Q Ahead",
+  baseline_rmse = dc_forecast_error_summary %>%
+    filter(forecast_horizon == "3Q Ahead") %>%
+    pull(baseline_RMSE),
+  enhanced_rmse = dc_forecast_error_summary %>%
+    filter(forecast_horizon == "3Q Ahead") %>%
+    pull(enhanced_RMSE),
+  rmse_lift_pct = dc_forecast_error_summary %>%
+    filter(forecast_horizon == "3Q Ahead") %>%
+    pull(RMSE_lift_pct),
+  baseline_mae = dc_forecast_error_summary %>%
+    filter(forecast_horizon == "3Q Ahead") %>%
+    pull(baseline_MAE),
+  enhanced_mae = dc_forecast_error_summary %>%
+    filter(forecast_horizon == "3Q Ahead") %>%
+    pull(enhanced_MAE),
+  mae_lift_pct = dc_forecast_error_summary %>%
+    filter(forecast_horizon == "3Q Ahead") %>%
+    pull(MAE_lift_pct),
+  baseline_r_squared = dc_rsq_table$baseline_r_squared,
+  enhanced_r_squared = dc_rsq_table$enhanced_r_squared
+)
+
+data_center_final_summary %>%
+  mutate(
+    baseline_rmse = comma(round(baseline_rmse)),
+    enhanced_rmse = comma(round(enhanced_rmse)),
+    rmse_lift_pct = percent(rmse_lift_pct / 100, accuracy = 0.1),
+    baseline_mae = comma(round(baseline_mae)),
+    enhanced_mae = comma(round(enhanced_mae)),
+    mae_lift_pct = percent(mae_lift_pct / 100, accuracy = 0.1),
+    baseline_r_squared = round(baseline_r_squared, 3),
+    enhanced_r_squared = round(enhanced_r_squared, 3)
+  ) %>%
+  kable(
+    caption = "Data Center Final Sector Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 56 — Warehouse Final Sector Summary Table
+
+warehouse_rsq_table <- tibble(
+  baseline_r_squared = summary(warehouse_horizon_results[["4Q Ahead"]]$baseline_model)$r.squared,
+  enhanced_r_squared = summary(warehouse_horizon_results[["4Q Ahead"]]$augmented_model)$r.squared
+)
+
+warehouse_final_summary <- tibble(
+  segment = "Warehouse",
+  preferred_horizon = "4Q Ahead",
+  baseline_rmse = warehouse_forecast_error_summary %>%
+    filter(forecast_horizon == "4Q Ahead") %>%
+    pull(baseline_RMSE),
+  enhanced_rmse = warehouse_forecast_error_summary %>%
+    filter(forecast_horizon == "4Q Ahead") %>%
+    pull(enhanced_RMSE),
+  rmse_lift_pct = warehouse_forecast_error_summary %>%
+    filter(forecast_horizon == "4Q Ahead") %>%
+    pull(RMSE_lift_pct),
+  baseline_mae = warehouse_forecast_error_summary %>%
+    filter(forecast_horizon == "4Q Ahead") %>%
+    pull(baseline_MAE),
+  enhanced_mae = warehouse_forecast_error_summary %>%
+    filter(forecast_horizon == "4Q Ahead") %>%
+    pull(enhanced_MAE),
+  mae_lift_pct = warehouse_forecast_error_summary %>%
+    filter(forecast_horizon == "4Q Ahead") %>%
+    pull(MAE_lift_pct),
+  baseline_r_squared = warehouse_rsq_table$baseline_r_squared,
+  enhanced_r_squared = warehouse_rsq_table$enhanced_r_squared
+)
+
+warehouse_final_summary %>%
+  mutate(
+    baseline_rmse = comma(round(baseline_rmse)),
+    enhanced_rmse = comma(round(enhanced_rmse)),
+    rmse_lift_pct = percent(rmse_lift_pct / 100, accuracy = 0.1),
+    baseline_mae = comma(round(baseline_mae)),
+    enhanced_mae = comma(round(enhanced_mae)),
+    mae_lift_pct = percent(mae_lift_pct / 100, accuracy = 0.1),
+    baseline_r_squared = round(baseline_r_squared, 3),
+    enhanced_r_squared = round(enhanced_r_squared, 3)
+  ) %>%
+  kable(
+    caption = "Warehouse Final Sector Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 57 — Cross-Sector Final Summary Table
+
+cross_sector_final_summary <- bind_rows(
+  data_center_final_summary,
+  warehouse_final_summary
+)
+
+cross_sector_final_summary %>%
+  mutate(
+    baseline_rmse = comma(round(baseline_rmse)),
+    enhanced_rmse = comma(round(enhanced_rmse)),
+    rmse_lift_pct = percent(rmse_lift_pct / 100, accuracy = 0.1),
+    baseline_mae = comma(round(baseline_mae)),
+    enhanced_mae = comma(round(enhanced_mae)),
+    mae_lift_pct = percent(mae_lift_pct / 100, accuracy = 0.1),
+    baseline_r_squared = round(baseline_r_squared, 3),
+    enhanced_r_squared = round(enhanced_r_squared, 3)
+  ) %>%
+  kable(
+    caption = "Cross-Sector Final Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 58 — Cross-Sector Preferred Indicator Table
+
+preferred_indicator_table <- tibble(
+  segment = c("Data Center", "Warehouse"),
+  preferred_horizon = c("3Q Ahead", "4Q Ahead"),
+  key_indicator = c("dc_spending_lag", "dgs10_lag"),
+  indicator_story = c(
+    "Data center construction spending provided the most useful longer-horizon signal.",
+    "The 10-Year Treasury Rate provided the most useful longer-horizon signal for warehouse demand."
+  )
+)
+
+preferred_indicator_table %>%
+  kable(
+    caption = "Preferred Indicator Story by Segment"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 59 — Data Center Seasonality Table
+
+dc_seasonality_table <- broom::tidy(
+  dc_horizon_results[["3Q Ahead"]]$augmented_model
+) %>%
+  filter(str_detect(term, "qtr")) %>%
+  mutate(
+    quarter = case_when(
+      term == "qtrQ2" ~ "Q2 vs Q1",
+      term == "qtrQ3" ~ "Q3 vs Q1",
+      term == "qtrQ4" ~ "Q4 vs Q1"
+    ),
+    direction = if_else(estimate > 0, "Positive", "Negative"),
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(
+    quarter,
+    estimate,
+    p.value,
+    significance,
+    direction
+  )
+
+dc_seasonality_table %>%
+  mutate(
+    estimate = comma(round(estimate)),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Data Center Seasonality Effects (Reference Quarter = Q1)"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 60 — Warehouse Seasonality Table
+
+warehouse_seasonality_table <- broom::tidy(
+  warehouse_horizon_results[["4Q Ahead"]]$augmented_model
+) %>%
+  filter(str_detect(term, "qtr")) %>%
+  mutate(
+    quarter = case_when(
+      term == "qtrQ2" ~ "Q2 vs Q1",
+      term == "qtrQ3" ~ "Q3 vs Q1",
+      term == "qtrQ4" ~ "Q4 vs Q1"
+    ),
+    direction = if_else(estimate > 0, "Positive", "Negative"),
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(
+    quarter,
+    estimate,
+    p.value,
+    significance,
+    direction
+  )
+
+warehouse_seasonality_table %>%
+  mutate(
+    estimate = comma(round(estimate)),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Warehouse Seasonality Effects (Reference Quarter = Q1)"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 61 — Cross-Sector Seasonality Summary
+
+cross_sector_seasonality_summary <- bind_rows(
+  dc_seasonality_table %>%
+    mutate(segment = "Data Center"),
+  warehouse_seasonality_table %>%
+    mutate(segment = "Warehouse")
+) %>%
+  select(
+    segment,
+    quarter,
+    estimate,
+    p.value,
+    significance,
+    direction
+  )
+
+cross_sector_seasonality_summary %>%
+  mutate(
+    estimate = comma(round(estimate)),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Cross-Sector Seasonality Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 62 — Data Center Preferred Horizon Quarter-by-Quarter Error Table
+
+dc_preferred_error_table <- dc_horizon_results[["3Q Ahead"]]$predictions %>%
+  transmute(
+    quarter,
+    actual_labor_hours = labor_hours,
+    baseline_forecast,
+    enhanced_forecast = augmented_forecast,
+    baseline_abs_error = abs(labor_hours - baseline_forecast),
+    enhanced_abs_error = abs(labor_hours - augmented_forecast),
+    closer_model = case_when(
+      enhanced_abs_error < baseline_abs_error ~ "Enhanced",
+      enhanced_abs_error > baseline_abs_error ~ "Baseline",
+      TRUE ~ "Tie"
+    )
+  )
+
+dc_preferred_error_table %>%
+  mutate(
+    across(
+      c(actual_labor_hours, baseline_forecast, enhanced_forecast,
+        baseline_abs_error, enhanced_abs_error),
+      ~ comma(round(.))
+    )
+  ) %>%
+  kable(
+    caption = "Data Center 3Q Ahead Quarter-by-Quarter Error Comparison"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 63 — Warehouse Preferred Horizon Quarter-by-Quarter Error Table
+
+warehouse_preferred_error_table <- warehouse_horizon_results[["4Q Ahead"]]$predictions %>%
+  transmute(
+    quarter,
+    actual_labor_hours = labor_hours,
+    baseline_forecast,
+    enhanced_forecast = augmented_forecast,
+    baseline_abs_error = abs(labor_hours - baseline_forecast),
+    enhanced_abs_error = abs(labor_hours - augmented_forecast),
+    closer_model = case_when(
+      enhanced_abs_error < baseline_abs_error ~ "Enhanced",
+      enhanced_abs_error > baseline_abs_error ~ "Baseline",
+      TRUE ~ "Tie"
+    )
+  )
+
+warehouse_preferred_error_table %>%
+  mutate(
+    across(
+      c(actual_labor_hours, baseline_forecast, enhanced_forecast,
+        baseline_abs_error, enhanced_abs_error),
+      ~ comma(round(.))
+    )
+  ) %>%
+  kable(
+    caption = "Warehouse 4Q Ahead Quarter-by-Quarter Error Comparison"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK 64 — Sector Macro Variable Mapping Table
+
+sector_macro_variable_mapping <- tibble(
+  segment = c("Data Center", "Warehouse"),
+  variables_tested = c(
+    "dc_spending, pce_deflator, tcu, utility_production",
+    "ecom_sales, pnfi, tlnrescons, indpro, dgs10"
+  ),
+  variables_retained_or_most_useful = c(
+    "dc_spending_lag, utility_production_lag",
+    "ecom_lag, dgs10_lag"
+  ),
+  preferred_horizon = c("3Q Ahead", "4Q Ahead")
+)
+
+sector_macro_variable_mapping %>%
+  kable(
+    caption = "Sector Macro Variable Mapping"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A1 — Load Apartment External Files
+
+permit5_raw <- read_excel("PERMIT5.xlsx", sheet = "Monthly") %>%
+  clean_names()
+
+houst5f_raw <- read_excel("HOUST5F.xlsx", sheet = "Monthly") %>%
+  clean_names()
+
+dgs10_apartment_raw <- read_excel("DGS10.xlsx", sheet = "Daily") %>%
+  clean_names()
+
+undcon5musa_raw <- read_excel("UNDCON5MUSA.xlsx", sheet = "Monthly") %>%
+  clean_names()
+
+compu5musa_raw <- read_excel("COMPU5MUSA.xlsx", sheet = "Monthly") %>%
+  clean_names()
+```
+
+```{r}
+# CHUNK A2 — Clean Apartment External Files
+
+permit5_clean <- permit5_raw %>%
+  rename(
+    observation_date = observation_date,
+    permit5 = permit5
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, permit5)
+
+houst5f_clean <- houst5f_raw %>%
+  rename(
+    observation_date = observation_date,
+    houst5f = houst5f
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, houst5f)
+
+dgs10_apartment_clean <- dgs10_apartment_raw %>%
+  rename(
+    observation_date = observation_date,
+    dgs10 = dgs10
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, dgs10)
+
+undcon5musa_clean <- undcon5musa_raw %>%
+  rename(
+    observation_date = observation_date,
+    undcon5musa = undcon5musa
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, undcon5musa)
+
+compu5musa_clean <- compu5musa_raw %>%
+  rename(
+    observation_date = observation_date,
+    compu5musa = compu5musa
+  ) %>%
+  mutate(
+    observation_date = ymd(observation_date)
+  ) %>%
+  select(observation_date, compu5musa)
+
+permit5_clean
+houst5f_clean
+dgs10_apartment_clean
+undcon5musa_clean
+compu5musa_clean
+```
+
+```{r}
+# CHUNK A3 — Build Apartment Internal Quarterly Labor-Hours Data
+
+apartment_jobs <- jobs_enriched %>%
+  filter(project_type == "APARTMENT") %>%
+  mutate(
+    quarter = floor_date(true_start_date, "quarter")
+  )
+
+apartment_job_starts_quarterly <- apartment_jobs %>%
+  filter(!is.na(quarter)) %>%
+  group_by(quarter) %>%
+  summarise(
+    job_starts = n_distinct(job_id),
+    .groups = "drop"
+  )
+
+apartment_labor_hours_quarterly <- labor %>%
+  left_join(
+    apartment_jobs %>% select(job_id),
+    by = "job_id"
+  ) %>%
+  mutate(
+    quarter = floor_date(work_date, "quarter")
+  ) %>%
+  filter(!is.na(job_id)) %>%
+  group_by(quarter) %>%
+  summarise(
+    labor_hours = sum(hrs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+apartment_quarterly <- apartment_job_starts_quarterly %>%
+  full_join(apartment_labor_hours_quarterly, by = "quarter") %>%
+  arrange(quarter)
+
+apartment_quarterly
+```
+
+```{r}
+# CHUNK A4 — Remove Incomplete Final Quarter and Define Common Complete-Quarter Range
+
+apartment_quarterly <- apartment_quarterly %>%
+  filter(quarter <= last_complete_quarter)
+
+min_q_apartment <- max(
+  floor_date(min(permit5_clean$observation_date, na.rm = TRUE), "quarter"),
+  floor_date(min(houst5f_clean$observation_date, na.rm = TRUE), "quarter"),
+  floor_date(min(dgs10_apartment_clean$observation_date, na.rm = TRUE), "quarter"),
+  floor_date(min(undcon5musa_clean$observation_date, na.rm = TRUE), "quarter"),
+  floor_date(min(compu5musa_clean$observation_date, na.rm = TRUE), "quarter"),
+  min(apartment_quarterly$quarter, na.rm = TRUE)
+)
+
+max_q_apartment <- min(
+  max(apartment_quarterly$quarter, na.rm = TRUE),
+  last_complete_quarter
+)
+
+min_q_apartment
+max_q_apartment
+```
+
+```{r}
+# CHUNK A5 — Convert Apartment External Series to Quarterly
+
+to_quarterly_mean <- function(df, value_col, out_name, min_q, max_q) {
+  df %>%
+    mutate(quarter = floor_date(observation_date, "quarter")) %>%
+    group_by(quarter) %>%
+    summarise(value = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    rename(!!out_name := value) %>%
+    filter(quarter >= min_q, quarter <= max_q)
+}
+
+permit5_q <- to_quarterly_mean(permit5_clean, "permit5", "permit5", min_q_apartment, max_q_apartment)
+houst5f_q <- to_quarterly_mean(houst5f_clean, "houst5f", "houst5f", min_q_apartment, max_q_apartment)
+dgs10_apartment_q <- to_quarterly_mean(dgs10_apartment_clean, "dgs10", "dgs10", min_q_apartment, max_q_apartment)
+undcon5musa_q <- to_quarterly_mean(undcon5musa_clean, "undcon5musa", "undcon5musa", min_q_apartment, max_q_apartment)
+compu5musa_q <- to_quarterly_mean(compu5musa_clean, "compu5musa", "compu5musa", min_q_apartment, max_q_apartment)
+
+permit5_q
+houst5f_q
+dgs10_apartment_q
+undcon5musa_q
+compu5musa_q
+```
+
+```{r}
+# CHUNK A6 — Merge Apartment External Quarterly Data
+
+apartment_external_indicators_q <- permit5_q %>%
+  full_join(houst5f_q, by = "quarter") %>%
+  full_join(dgs10_apartment_q, by = "quarter") %>%
+  full_join(undcon5musa_q, by = "quarter") %>%
+  full_join(compu5musa_q, by = "quarter") %>%
+  arrange(quarter)
+
+apartment_external_indicators_q
+```
+
+```{r}
+# CHUNK A7 — Merge Apartment Internal + External Data
+
+apartment_model_data <- apartment_quarterly %>%
+  filter(quarter >= min_q_apartment, quarter <= max_q_apartment) %>%
+  left_join(apartment_external_indicators_q, by = "quarter") %>%
+  arrange(quarter)
+
+glimpse(apartment_model_data)
+head(apartment_model_data)
+```
+
+```{r}
+# CHUNK A8 — Quick Visual Check of Apartment External Indicators
+
+apartment_external_long <- apartment_external_indicators_q %>%
+  pivot_longer(
+    cols = -quarter,
+    names_to = "indicator",
+    values_to = "value"
+  )
+
+ggplot(apartment_external_long, aes(x = quarter, y = value, color = indicator)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ indicator, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Quarterly Apartment External Indicators",
+    x = "Quarter",
+    y = "Value",
+    color = "Indicator"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK A9 — Create Apartment Final Modeling Variables
+
+apartment_model_data <- apartment_model_data %>%
+  arrange(quarter) %>%
+  mutate(
+    qtr = factor(
+      paste0("Q", lubridate::quarter(quarter)),
+      levels = c("Q1", "Q2", "Q3", "Q4")
+    ),
+    time_index = row_number(),
+
+    labor_hours_lag1 = lag(labor_hours, 1),
+    labor_hours_lag2 = lag(labor_hours, 2),
+    labor_hours_lag3 = lag(labor_hours, 3),
+    labor_hours_lag4 = lag(labor_hours, 4),
+
+    permit5_lag1 = lag(permit5, 1),
+    permit5_lag2 = lag(permit5, 2),
+    permit5_lag3 = lag(permit5, 3),
+    permit5_lag4 = lag(permit5, 4),
+
+    dgs10_lag1 = lag(dgs10, 1),
+    dgs10_lag2 = lag(dgs10, 2),
+    dgs10_lag3 = lag(dgs10, 3),
+    dgs10_lag4 = lag(dgs10, 4),
+
+    undcon5musa_lag1 = lag(undcon5musa, 1),
+    undcon5musa_lag2 = lag(undcon5musa, 2),
+    undcon5musa_lag3 = lag(undcon5musa, 3),
+    undcon5musa_lag4 = lag(undcon5musa, 4)
+  )
+
+glimpse(apartment_model_data)
+```
+
+```{r}
+# CHUNK A10 — Apartment Horizon-Specific Forecasting Function
+
+fit_apartment_horizon_models <- function(data, horizon, test_periods = 4) {
+
+  horizon_data <- data %>%
+    transmute(
+      quarter,
+      qtr,
+      time_index,
+      labor_hours,
+      labor_hours_lag = .data[[paste0("labor_hours_lag", horizon)]],
+      permit5_lag = .data[[paste0("permit5_lag", horizon)]],
+      dgs10_lag = .data[[paste0("dgs10_lag", horizon)]]
+    ) %>%
+    drop_na()
+
+  n_obs <- nrow(horizon_data)
+
+  if (n_obs < 8) {
+    stop(paste("Not enough observations available for horizon", horizon))
+  }
+
+  test_n <- min(test_periods, max(2, floor(n_obs * 0.25)))
+  train_n <- n_obs - test_n
+
+  train_data <- horizon_data %>%
+    slice(1:train_n)
+
+  test_data <- horizon_data %>%
+    slice((train_n + 1):n_obs)
+
+  baseline_model <- lm(
+    labor_hours ~ labor_hours_lag + time_index + qtr,
+    data = train_data
+  )
+
+  augmented_model <- lm(
+    labor_hours ~ labor_hours_lag + permit5_lag + dgs10_lag + time_index + qtr,
+    data = train_data
+  )
+
+  test_predictions <- test_data %>%
+    mutate(
+      baseline_forecast = predict(baseline_model, newdata = test_data),
+      augmented_forecast = predict(augmented_model, newdata = test_data)
+    )
+
+  baseline_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$baseline_forecast
+  )
+
+  augmented_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$augmented_forecast
+  )
+
+  list(
+    horizon = horizon,
+    horizon_data = horizon_data,
+    train_data = train_data,
+    test_data = test_data,
+    baseline_model = baseline_model,
+    augmented_model = augmented_model,
+    predictions = test_predictions,
+    baseline_metrics = baseline_metrics,
+    augmented_metrics = augmented_metrics
+  )
+}
+```
+
+```{r}
+# CHUNK A11 — Run True 1Q, 2Q, 3Q, and 4Q Ahead Apartment Models
+
+apartment_horizon_results <- list(
+  `1Q Ahead` = fit_apartment_horizon_models(apartment_model_data, horizon = 1),
+  `2Q Ahead` = fit_apartment_horizon_models(apartment_model_data, horizon = 2),
+  `3Q Ahead` = fit_apartment_horizon_models(apartment_model_data, horizon = 3),
+  `4Q Ahead` = fit_apartment_horizon_models(apartment_model_data, horizon = 4)
+)
+
+names(apartment_horizon_results)
+```
+
+```{r}
+# CHUNK A12 — Apartment Forecast Error Summary Table
+
+apartment_forecast_error_summary <- bind_rows(
+  lapply(names(apartment_horizon_results), function(h_name) {
+    result <- apartment_horizon_results[[h_name]]
+
+    tibble(
+      segment = "Apartment",
+      forecast_horizon = h_name,
+      baseline_MAE = result$baseline_metrics$MAE,
+      enhanced_MAE = result$augmented_metrics$MAE,
+      baseline_MAPE = result$baseline_metrics$MAPE,
+      enhanced_MAPE = result$augmented_metrics$MAPE,
+      baseline_RMSE = result$baseline_metrics$RMSE,
+      enhanced_RMSE = result$augmented_metrics$RMSE
+    )
+  })
+) %>%
+  mutate(
+    MAE_lift_pct = ((baseline_MAE - enhanced_MAE) / baseline_MAE) * 100,
+    MAPE_lift_pct = ((baseline_MAPE - enhanced_MAPE) / baseline_MAPE) * 100,
+    RMSE_lift_pct = ((baseline_RMSE - enhanced_RMSE) / baseline_RMSE) * 100
+  )
+
+apartment_forecast_error_summary %>%
+  mutate(
+    across(
+      c(
+        baseline_MAE, enhanced_MAE,
+        baseline_RMSE, enhanced_RMSE
+      ),
+      ~ comma(round(.))
+    ),
+    across(
+      c(
+        baseline_MAPE, enhanced_MAPE,
+        MAE_lift_pct, MAPE_lift_pct, RMSE_lift_pct
+      ),
+      ~ percent(. / 100, accuracy = 0.1)
+    )
+  ) %>%
+  kable(
+    caption = "Apartment Forecast Error Summary by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A13 — Apartment Lift in Accuracy Summary Table
+
+apartment_lift_summary <- apartment_forecast_error_summary %>%
+  select(
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE,
+    RMSE_lift_pct,
+    baseline_MAE,
+    enhanced_MAE,
+    MAE_lift_pct
+  )
+
+apartment_lift_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Apartment Lift in Accuracy from External Indicators"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A14 — Apartment Baseline and Augmented Coefficients by Horizon
+
+apartment_coefficients_by_horizon <- bind_rows(
+  lapply(names(apartment_horizon_results), function(h_name) {
+    result <- apartment_horizon_results[[h_name]]
+
+    baseline_tidy <- tidy(result$baseline_model) %>%
+      mutate(
+        model_type = "Baseline",
+        forecast_horizon = h_name
+      )
+
+    augmented_tidy <- tidy(result$augmented_model) %>%
+      mutate(
+        model_type = "Augmented",
+        forecast_horizon = h_name
+      )
+
+    bind_rows(baseline_tidy, augmented_tidy)
+  })
+) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+apartment_coefficients_by_horizon %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Apartment Regression Coefficients by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A15 — Apartment Indicators Tested Summary by Horizon
+
+apartment_indicator_tested_summary <- apartment_coefficients_by_horizon %>%
+  filter(
+    model_type == "Augmented",
+    !term %in% c("(Intercept)", "labor_hours_lag", "time_index"),
+    !str_detect(term, "^qtr")
+  ) %>%
+  mutate(
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    ),
+    included_in_final_model = if_else(p.value < 0.10, "Yes", "No")
+  ) %>%
+  select(
+    forecast_horizon,
+    indicator = term,
+    estimate,
+    p.value,
+    significance,
+    direction,
+    included_in_final_model
+  )
+
+apartment_indicator_tested_summary %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Apartment Indicators Tested by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A16 — Apartment RMSE Comparison Plot by Horizon
+
+apartment_rmse_plot_data <- apartment_forecast_error_summary %>%
+  select(
+    forecast_horizon,
+    baseline_RMSE,
+    enhanced_RMSE
+  ) %>%
+  pivot_longer(
+    cols = c(baseline_RMSE, enhanced_RMSE),
+    names_to = "model_type",
+    values_to = "RMSE"
+  ) %>%
+  mutate(
+    model_type = recode(
+      model_type,
+      baseline_RMSE = "Baseline",
+      enhanced_RMSE = "Enhanced"
+    ),
+    forecast_horizon = factor(
+      forecast_horizon,
+      levels = c("1Q Ahead", "2Q Ahead", "3Q Ahead", "4Q Ahead")
+    )
+  )
+
+ggplot(apartment_rmse_plot_data, aes(x = forecast_horizon, y = RMSE, fill = model_type)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Apartment RMSE by Forecast Horizon",
+    subtitle = "Baseline vs Enhanced Models",
+    x = "Forecast Horizon",
+    y = "RMSE",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK A17 — Apartment Preferred Forecast Horizon for Reporting
+
+apartment_best_horizon_summary <- apartment_forecast_error_summary %>%
+  slice_max(RMSE_lift_pct, n = 1)
+
+apartment_best_horizon_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Apartment Preferred Forecast Horizon for Reporting"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A18 — Apartment Preferred Model Selection
+
+apartment_preferred_horizon <- apartment_best_horizon_summary %>%
+  pull(forecast_horizon)
+
+apartment_final_predictions <- apartment_horizon_results[[apartment_preferred_horizon]]$predictions %>%
+  mutate(
+    baseline_abs_error = abs(labor_hours - baseline_forecast),
+    enhanced_abs_error = abs(labor_hours - augmented_forecast),
+    closer_model = case_when(
+      enhanced_abs_error < baseline_abs_error ~ "Enhanced",
+      baseline_abs_error < enhanced_abs_error ~ "Baseline",
+      TRUE ~ "Tie"
+    )
+  )
+
+apartment_final_predictions %>%
+  select(
+    quarter,
+    labor_hours,
+    baseline_forecast,
+    augmented_forecast,
+    baseline_abs_error,
+    enhanced_abs_error,
+    closer_model
+  ) %>%
+  mutate(
+    across(
+      c(
+        labor_hours,
+        baseline_forecast,
+        augmented_forecast,
+        baseline_abs_error,
+        enhanced_abs_error
+      ),
+      ~ comma(round(.))
+    )
+  ) %>%
+  kable(
+    caption = "Apartment Quarter-by-Quarter Forecast Comparison"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A19 — Apartment Actual vs Baseline vs Enhanced Plot
+
+apartment_plot_data <- apartment_final_predictions %>%
+  select(
+    quarter,
+    labor_hours,
+    baseline_forecast,
+    augmented_forecast
+  ) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_forecast, augmented_forecast),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_forecast = "Baseline Forecast",
+      augmented_forecast = "Enhanced Forecast"
+    )
+  )
+
+ggplot(apartment_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = paste0("Apartment ", apartment_preferred_horizon, " Forecast: Actual vs Predicted"),
+    subtitle = "Preferred Horizon Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK A20 — Apartment Full Timeline Fitted Plot
+
+apartment_full_data <- apartment_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    time_index,
+    labor_hours,
+    labor_hours_lag = .data[[paste0("labor_hours_lag", as.integer(substr(apartment_preferred_horizon, 1, 1)))]],
+    permit5_lag = .data[[paste0("permit5_lag", as.integer(substr(apartment_preferred_horizon, 1, 1)))]],
+    dgs10_lag = .data[[paste0("dgs10_lag", as.integer(substr(apartment_preferred_horizon, 1, 1)))]]
+  ) %>%
+  drop_na()
+
+apartment_baseline_full <- lm(
+  labor_hours ~ labor_hours_lag + time_index + qtr,
+  data = apartment_full_data
+)
+
+apartment_augmented_full <- lm(
+  labor_hours ~ labor_hours_lag + permit5_lag + dgs10_lag + time_index + qtr,
+  data = apartment_full_data
+)
+
+apartment_full_plot_data <- apartment_full_data %>%
+  mutate(
+    baseline_fitted = predict(apartment_baseline_full, newdata = apartment_full_data),
+    augmented_fitted = predict(apartment_augmented_full, newdata = apartment_full_data)
+  ) %>%
+  select(quarter, labor_hours, baseline_fitted, augmented_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted, augmented_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted",
+      augmented_fitted = "Enhanced Fitted"
+    )
+  )
+
+ggplot(apartment_full_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.1) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Apartment Full Timeline: Actual vs Baseline vs Enhanced",
+    subtitle = "Historical Fitted Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK A21 — Apartment Seasonality Effects
+
+apartment_seasonality_summary <- tidy(
+  apartment_horizon_results[[apartment_preferred_horizon]]$baseline_model
+) %>%
+  filter(str_detect(term, "^qtr")) %>%
+  mutate(
+    quarter = recode(
+      term,
+      qtrQ2 = "Q2 vs Q1",
+      qtrQ3 = "Q3 vs Q1",
+      qtrQ4 = "Q4 vs Q1"
+    ),
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    ),
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    )
+  ) %>%
+  select(
+    quarter,
+    estimate,
+    p.value,
+    significance,
+    direction
+  )
+
+apartment_seasonality_summary %>%
+  mutate(
+    estimate = comma(round(estimate)),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Apartment Seasonality Effects (Reference Quarter = Q1)"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A22 — Apartment Final Indicator Story
+
+apartment_indicator_story <- tibble(
+  segment = "Apartment",
+  preferred_horizon = apartment_preferred_horizon,
+  variables_tested = "permit5, houst5f, dgs10, undcon5musa, compu5musa",
+  variables_retained_or_most_useful = "permit5, dgs10, time_index",
+  key_story = "Apartment permit activity provided the clearest external directional signal, but no tested external indicator combination produced a reliable 3Q–4Q forecasting improvement over the baseline.",
+  business_takeaway = "For Apartment, the internal baseline model remained stronger than the enhanced models. This suggests apartment demand is driven more by internal history, trend, and seasonality than by the external macro indicators tested."
+)
+
+apartment_indicator_story %>%
+  kable(
+    caption = "Apartment Final Indicator Story"
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+apartment_indicator_story <- tibble(
+  segment = "Apartment",
+  preferred_horizon = apartment_preferred_horizon,
+  variables_tested = "permit5, houst5f, dgs10, undcon5musa, compu5musa",
+  variables_retained_or_most_useful = "permit5, dgs10, time_index",
+  key_story = "Apartment permit activity provided the clearest external directional signal, but no tested external indicator combination produced a reliable 3Q–4Q forecasting improvement over the baseline.",
+  business_takeaway = "For Apartment, the internal baseline model remained stronger than the enhanced models. This suggests apartment demand is driven more by internal history, trend, and seasonality than by the external macro indicators tested."
+)
+```
+
+```{r}
+# CHUNK A23 — Apartment Final Sector Summary
+
+apartment_final_summary <- tibble(
+  segment = "Apartment",
+  preferred_horizon = apartment_preferred_horizon,
+  baseline_rmse = apartment_forecast_error_summary %>%
+    filter(forecast_horizon == apartment_preferred_horizon) %>%
+    pull(baseline_RMSE),
+  enhanced_rmse = apartment_forecast_error_summary %>%
+    filter(forecast_horizon == apartment_preferred_horizon) %>%
+    pull(enhanced_RMSE),
+  rmse_lift_pct = apartment_forecast_error_summary %>%
+    filter(forecast_horizon == apartment_preferred_horizon) %>%
+    pull(RMSE_lift_pct),
+  baseline_mae = apartment_forecast_error_summary %>%
+    filter(forecast_horizon == apartment_preferred_horizon) %>%
+    pull(baseline_MAE),
+  enhanced_mae = apartment_forecast_error_summary %>%
+    filter(forecast_horizon == apartment_preferred_horizon) %>%
+    pull(enhanced_MAE),
+  mae_lift_pct = apartment_forecast_error_summary %>%
+    filter(forecast_horizon == apartment_preferred_horizon) %>%
+    pull(MAE_lift_pct),
+  baseline_r_squared = summary(apartment_horizon_results[[apartment_preferred_horizon]]$baseline_model)$adj.r.squared,
+  enhanced_r_squared = summary(apartment_horizon_results[[apartment_preferred_horizon]]$augmented_model)$adj.r.squared
+)
+
+apartment_final_summary %>%
+  mutate(
+    baseline_rmse = comma(round(baseline_rmse)),
+    enhanced_rmse = comma(round(enhanced_rmse)),
+    rmse_lift_pct = percent(rmse_lift_pct / 100, accuracy = 0.1),
+    baseline_mae = comma(round(baseline_mae)),
+    enhanced_mae = comma(round(enhanced_mae)),
+    mae_lift_pct = percent(mae_lift_pct / 100, accuracy = 0.1),
+    baseline_r_squared = round(baseline_r_squared, 3),
+    enhanced_r_squared = round(enhanced_r_squared, 3)
+  ) %>%
+  kable(
+    caption = "Apartment Final Sector Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK A24 — Apartment Long-Horizon Focused Models (3Q & 4Q Only)
+
+fit_apartment_long_horizon <- function(data, horizon, vars) {
+
+  model_data <- data %>%
+    transmute(
+      quarter,
+      qtr,
+      labor_hours,
+      labor_hours_lag = .data[[paste0("labor_hours_lag", horizon)]],
+      permit5_lag = .data[[paste0("permit5_lag", horizon)]],
+      dgs10_lag = .data[[paste0("dgs10_lag", horizon)]],
+      undcon5musa_lag = .data[[paste0("undcon5musa_lag", horizon)]]
+    ) %>%
+    drop_na()
+
+  n_obs <- nrow(model_data)
+
+  test_n <- min(4, max(2, floor(n_obs * 0.25)))
+  train_n <- n_obs - test_n
+
+  train_data <- model_data %>% slice(1:train_n)
+  test_data  <- model_data %>% slice((train_n + 1):n_obs)
+
+  # Baseline (no external indicators)
+  baseline_model <- lm(
+    labor_hours ~ labor_hours_lag + qtr,
+    data = train_data
+  )
+
+  # Build formula dynamically
+  formula_text <- paste(
+    "labor_hours ~ labor_hours_lag +",
+    paste(vars, collapse = " + "),
+    "+ qtr"
+  )
+
+  enhanced_model <- lm(
+    as.formula(formula_text),
+    data = train_data
+  )
+
+  test_data <- test_data %>%
+    mutate(
+      baseline_pred = predict(baseline_model, newdata = test_data),
+      enhanced_pred = predict(enhanced_model, newdata = test_data)
+    )
+
+  baseline_metrics <- calculate_error_metrics(
+    test_data$labor_hours,
+    test_data$baseline_pred
+  )
+
+  enhanced_metrics <- calculate_error_metrics(
+    test_data$labor_hours,
+    test_data$enhanced_pred
+  )
+
+  tibble(
+    horizon = paste0(horizon, "Q Ahead"),
+    model = paste(vars, collapse = " + "),
+    baseline_RMSE = baseline_metrics$RMSE,
+    enhanced_RMSE = enhanced_metrics$RMSE,
+    RMSE_lift_pct = ((baseline_metrics$RMSE - enhanced_metrics$RMSE) / baseline_metrics$RMSE) * 100
+  )
+}
+```
+
+```{r}
+# CHUNK A25 — Test Long-Horizon Indicator Combinations
+
+apartment_long_horizon_results <- bind_rows(
+
+  # 3Q models
+  fit_apartment_long_horizon(apartment_model_data, 3,
+                            vars = c("permit5_lag")),
+  fit_apartment_long_horizon(apartment_model_data, 3,
+                            vars = c("permit5_lag", "undcon5musa_lag")),
+  fit_apartment_long_horizon(apartment_model_data, 3,
+                            vars = c("permit5_lag", "dgs10_lag")),
+  fit_apartment_long_horizon(apartment_model_data, 3,
+                            vars = c("permit5_lag", "undcon5musa_lag", "dgs10_lag")),
+
+  # 4Q models
+  fit_apartment_long_horizon(apartment_model_data, 4,
+                            vars = c("permit5_lag")),
+  fit_apartment_long_horizon(apartment_model_data, 4,
+                            vars = c("permit5_lag", "undcon5musa_lag")),
+  fit_apartment_long_horizon(apartment_model_data, 4,
+                            vars = c("permit5_lag", "dgs10_lag")),
+  fit_apartment_long_horizon(apartment_model_data, 4,
+                            vars = c("permit5_lag", "undcon5musa_lag", "dgs10_lag"))
+)
+
+apartment_long_horizon_results %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  arrange(desc(RMSE_lift_pct)) %>%
+  kable(
+    caption = "Apartment Long-Horizon (3Q–4Q) Model Comparison"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O1 — Load Office External Files
+
+uspbs_raw <- read_excel("USPBS.xlsx", sheet = "Monthly") %>% clean_names()
+tlnrescons_raw <- read_excel("TLNRESCONS.xlsx", sheet = "Monthly") %>% clean_names()
+dgs10_office_raw <- read_excel("DGS10.xlsx", sheet = "Daily") %>% clean_names()
+pnfi_raw <- read_excel("PNFI.xlsx", sheet = "Quarterly") %>% clean_names()
+```
+
+```{r}
+# CHUNK O2 — Clean Office External Files
+
+uspbs_clean <- uspbs_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, uspbs)
+
+tlnrescons_clean <- tlnrescons_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, tlnrescons)
+
+dgs10_office_clean <- dgs10_office_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, dgs10)
+
+pnfi_clean <- pnfi_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, pnfi)
+```
+
+```{r}
+# CHUNK O3 — Build Office Internal Data
+
+office_jobs <- jobs_enriched %>%
+  filter(project_type == "OFFICE") %>%
+  mutate(quarter = floor_date(true_start_date, "quarter"))
+
+office_job_starts_q <- office_jobs %>%
+  filter(!is.na(quarter)) %>%
+  group_by(quarter) %>%
+  summarise(
+    job_starts = n_distinct(job_id),
+    .groups = "drop"
+  )
+
+office_labor_q <- labor %>%
+  semi_join(
+    office_jobs %>% distinct(job_id),
+    by = "job_id"
+  ) %>%
+  mutate(
+    quarter = floor_date(work_date, "quarter")
+  ) %>%
+  filter(!is.na(quarter)) %>%
+  group_by(quarter) %>%
+  summarise(
+    labor_hours = sum(hrs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+office_quarterly <- office_job_starts_q %>%
+  full_join(office_labor_q, by = "quarter") %>%
+  arrange(quarter)
+
+office_quarterly
+```
+
+```{r}
+# CHUNK O4 — Define Time Range
+
+office_quarterly <- office_quarterly %>%
+  filter(quarter <= last_complete_quarter)
+
+min_q_office <- max(
+  floor_date(min(uspbs_clean$observation_date), "quarter"),
+  floor_date(min(tlnrescons_clean$observation_date), "quarter"),
+  floor_date(min(dgs10_office_clean$observation_date), "quarter"),
+  floor_date(min(pnfi_clean$observation_date), "quarter"),
+  min(office_quarterly$quarter)
+)
+
+max_q_office <- min(
+  max(office_quarterly$quarter),
+  last_complete_quarter
+)
+```
+
+```{r}
+# CHUNK O5 — Convert to Quarterly
+
+to_q <- function(df, col, name) {
+  df %>%
+    mutate(quarter = floor_date(observation_date, "quarter")) %>%
+    group_by(quarter) %>%
+    summarise(value = mean(.data[[col]], na.rm = TRUE), .groups = "drop") %>%
+    rename(!!name := value) %>%
+    filter(quarter >= min_q_office, quarter <= max_q_office)
+}
+
+uspbs_q <- to_q(uspbs_clean, "uspbs", "uspbs")
+tlnrescons_q <- to_q(tlnrescons_clean, "tlnrescons", "tlnrescons")
+dgs10_office_q <- to_q(dgs10_office_clean, "dgs10", "dgs10")
+pnfi_q <- to_q(pnfi_clean, "pnfi", "pnfi")
+```
+
+```{r}
+# CHUNK O6 — Merge Office External Indicators
+
+office_external_q <- uspbs_q %>%
+  full_join(tlnrescons_q, by = "quarter") %>%
+  full_join(dgs10_office_q, by = "quarter") %>%
+  full_join(pnfi_q, by = "quarter") %>%
+  arrange(quarter)
+```
+
+```{r}
+# CHUNK O7 — Final Office Model Data
+
+office_model_data <- office_quarterly %>%
+  filter(quarter >= min_q_office, quarter <= max_q_office) %>%
+  left_join(office_external_q, by = "quarter") %>%
+  arrange(quarter)
+
+glimpse(office_model_data)
+```
+
+```{r}
+# CHUNK O8 — Create Office Lag Variables + Time Index
+
+office_model_data <- office_model_data %>%
+  arrange(quarter) %>%
+  mutate(
+    qtr = factor(
+      paste0("Q", lubridate::quarter(quarter)),
+      levels = c("Q1", "Q2", "Q3", "Q4")
+    ),
+    time_index = row_number(),
+
+    labor_hours_lag1 = lag(labor_hours, 1),
+    labor_hours_lag2 = lag(labor_hours, 2),
+    labor_hours_lag3 = lag(labor_hours, 3),
+    labor_hours_lag4 = lag(labor_hours, 4),
+
+    uspbs_lag1 = lag(uspbs, 1),
+    uspbs_lag2 = lag(uspbs, 2),
+    uspbs_lag3 = lag(uspbs, 3),
+    uspbs_lag4 = lag(uspbs, 4),
+
+    tlnrescons_lag1 = lag(tlnrescons, 1),
+    tlnrescons_lag2 = lag(tlnrescons, 2),
+    tlnrescons_lag3 = lag(tlnrescons, 3),
+    tlnrescons_lag4 = lag(tlnrescons, 4),
+
+    dgs10_lag1 = lag(dgs10, 1),
+    dgs10_lag2 = lag(dgs10, 2),
+    dgs10_lag3 = lag(dgs10, 3),
+    dgs10_lag4 = lag(dgs10, 4),
+
+    pnfi_lag1 = lag(pnfi, 1),
+    pnfi_lag2 = lag(pnfi, 2),
+    pnfi_lag3 = lag(pnfi, 3),
+    pnfi_lag4 = lag(pnfi, 4)
+  )
+
+glimpse(office_model_data)
+```
+
+```{r}
+# CHUNK O9 — Updated Office Horizon-Specific Forecasting Function
+
+fit_office_horizon_models <- function(data, horizon, test_periods = 4) {
+
+  horizon_data <- data %>%
+    transmute(
+      quarter,
+      qtr,
+      time_index,
+      labor_hours,
+      labor_hours_lag = .data[[paste0("labor_hours_lag", horizon)]],
+      uspbs_lag = .data[[paste0("uspbs_lag", horizon)]],
+      tlnrescons_lag = .data[[paste0("tlnrescons_lag", horizon)]],
+      dgs10_lag = .data[[paste0("dgs10_lag", horizon)]],
+      pnfi_lag = .data[[paste0("pnfi_lag", horizon)]]
+    ) %>%
+    drop_na()
+
+  n_obs <- nrow(horizon_data)
+
+  if (n_obs < 8) {
+    stop(paste("Not enough observations available for horizon", horizon))
+  }
+
+  test_n <- min(test_periods, max(2, floor(n_obs * 0.25)))
+  train_n <- n_obs - test_n
+
+  train_data <- horizon_data %>% slice(1:train_n)
+  test_data  <- horizon_data %>% slice((train_n + 1):n_obs)
+
+  baseline_model <- lm(
+    labor_hours ~ labor_hours_lag + time_index + qtr,
+    data = train_data
+  )
+
+  augmented_model <- lm(
+    labor_hours ~ labor_hours_lag +
+      uspbs_lag +
+      tlnrescons_lag +
+      dgs10_lag +
+      pnfi_lag +
+      time_index +
+      qtr,
+    data = train_data
+  )
+
+  test_predictions <- test_data %>%
+    mutate(
+      baseline_forecast = predict(baseline_model, newdata = test_data),
+      augmented_forecast = predict(augmented_model, newdata = test_data)
+    )
+
+  baseline_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$baseline_forecast
+  )
+
+  augmented_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$augmented_forecast
+  )
+
+  list(
+    horizon = horizon,
+    horizon_data = horizon_data,
+    train_data = train_data,
+    test_data = test_data,
+    baseline_model = baseline_model,
+    augmented_model = augmented_model,
+    predictions = test_predictions,
+    baseline_metrics = baseline_metrics,
+    augmented_metrics = augmented_metrics
+  )
+}
+```
+
+```{r}
+# CHUNK O10 — Run 1Q, 2Q, 3Q, and 4Q Ahead Office Models
+
+office_horizon_results <- list(
+  `1Q Ahead` = fit_office_horizon_models(office_model_data, horizon = 1),
+  `2Q Ahead` = fit_office_horizon_models(office_model_data, horizon = 2),
+  `3Q Ahead` = fit_office_horizon_models(office_model_data, horizon = 3),
+  `4Q Ahead` = fit_office_horizon_models(office_model_data, horizon = 4)
+)
+
+names(office_horizon_results)
+```
+
+```{r}
+# CHUNK O11 — Office Forecast Error Summary
+
+office_forecast_error_summary <- bind_rows(
+  lapply(names(office_horizon_results), function(h_name) {
+    result <- office_horizon_results[[h_name]]
+
+    tibble(
+      segment = "Office",
+      forecast_horizon = h_name,
+      baseline_MAE = result$baseline_metrics$MAE,
+      enhanced_MAE = result$augmented_metrics$MAE,
+      baseline_MAPE = result$baseline_metrics$MAPE,
+      enhanced_MAPE = result$augmented_metrics$MAPE,
+      baseline_RMSE = result$baseline_metrics$RMSE,
+      enhanced_RMSE = result$augmented_metrics$RMSE
+    )
+  })
+) %>%
+  mutate(
+    MAE_lift_pct = ((baseline_MAE - enhanced_MAE) / baseline_MAE) * 100,
+    MAPE_lift_pct = ((baseline_MAPE - enhanced_MAPE) / baseline_MAPE) * 100,
+    RMSE_lift_pct = ((baseline_RMSE - enhanced_RMSE) / baseline_RMSE) * 100
+  )
+
+office_forecast_error_summary %>%
+  mutate(
+    across(
+      c(baseline_MAE, enhanced_MAE, baseline_RMSE, enhanced_RMSE),
+      ~ comma(round(.))
+    ),
+    across(
+      c(baseline_MAPE, enhanced_MAPE, MAE_lift_pct, MAPE_lift_pct, RMSE_lift_pct),
+      ~ percent(. / 100, accuracy = 0.1)
+    )
+  ) %>%
+  kable(
+    caption = "Office Forecast Error Summary by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O12 — Office RMSE Comparison Plot by Horizon
+
+office_rmse_plot_data <- office_forecast_error_summary %>%
+  select(forecast_horizon, baseline_RMSE, enhanced_RMSE) %>%
+  pivot_longer(
+    cols = c(baseline_RMSE, enhanced_RMSE),
+    names_to = "model_type",
+    values_to = "RMSE"
+  ) %>%
+  mutate(
+    model_type = recode(
+      model_type,
+      baseline_RMSE = "Baseline",
+      enhanced_RMSE = "Enhanced"
+    ),
+    forecast_horizon = factor(
+      forecast_horizon,
+      levels = c("1Q Ahead", "2Q Ahead", "3Q Ahead", "4Q Ahead")
+    )
+  )
+
+ggplot(office_rmse_plot_data, aes(x = forecast_horizon, y = RMSE, fill = model_type)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Office RMSE by Forecast Horizon",
+    subtitle = "Baseline vs Enhanced Models",
+    x = "Forecast Horizon",
+    y = "RMSE",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK O13 — Office Regression Coefficients by Horizon
+
+office_coefficients_by_horizon <- bind_rows(
+  lapply(names(office_horizon_results), function(h_name) {
+    result <- office_horizon_results[[h_name]]
+
+    baseline_tidy <- tidy(result$baseline_model) %>%
+      mutate(
+        model_type = "Baseline",
+        forecast_horizon = h_name
+      )
+
+    augmented_tidy <- tidy(result$augmented_model) %>%
+      mutate(
+        model_type = "Augmented",
+        forecast_horizon = h_name
+      )
+
+    bind_rows(baseline_tidy, augmented_tidy)
+  })
+) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+office_coefficients_by_horizon %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Office Regression Coefficients by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O14 — Office Indicators Tested Summary by Horizon
+
+office_indicator_tested_summary <- office_coefficients_by_horizon %>%
+  filter(
+    model_type == "Augmented",
+    !term %in% c("(Intercept)", "labor_hours_lag", "time_index"),
+    !str_detect(term, "^qtr")
+  ) %>%
+  mutate(
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    ),
+    included_in_final_model = if_else(p.value < 0.10, "Yes", "No")
+  ) %>%
+  select(
+    forecast_horizon,
+    indicator = term,
+    estimate,
+    p.value,
+    significance,
+    direction,
+    included_in_final_model
+  )
+
+office_indicator_tested_summary %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Office Indicators Tested by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O15 — Office Preferred Forecast Horizon
+
+office_best_horizon_summary <- office_forecast_error_summary %>%
+  slice_max(RMSE_lift_pct, n = 1)
+
+office_best_horizon_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Office Preferred Forecast Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O16 — Office Quarter-by-Quarter Forecast Comparison
+
+office_preferred_horizon <- office_best_horizon_summary %>%
+  pull(forecast_horizon)
+
+office_final_predictions <- office_horizon_results[[office_preferred_horizon]]$predictions %>%
+  mutate(
+    baseline_abs_error = abs(labor_hours - baseline_forecast),
+    enhanced_abs_error = abs(labor_hours - augmented_forecast),
+    closer_model = case_when(
+      enhanced_abs_error < baseline_abs_error ~ "Enhanced",
+      baseline_abs_error < enhanced_abs_error ~ "Baseline",
+      TRUE ~ "Tie"
+    )
+  )
+
+office_final_predictions %>%
+  select(
+    quarter,
+    labor_hours,
+    baseline_forecast,
+    augmented_forecast,
+    baseline_abs_error,
+    enhanced_abs_error,
+    closer_model
+  ) %>%
+  mutate(
+    across(
+      c(labor_hours, baseline_forecast, augmented_forecast, baseline_abs_error, enhanced_abs_error),
+      ~ comma(round(.))
+    )
+  ) %>%
+  kable(
+    caption = "Office Quarter-by-Quarter Forecast Comparison"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O17 — Office Actual vs Baseline vs Enhanced Plot
+
+office_plot_data <- office_final_predictions %>%
+  select(quarter, labor_hours, baseline_forecast, augmented_forecast) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_forecast, augmented_forecast),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_forecast = "Baseline Forecast",
+      augmented_forecast = "Enhanced Forecast"
+    )
+  )
+
+ggplot(office_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = paste0("Office ", office_preferred_horizon, " Forecast: Actual vs Predicted"),
+    subtitle = "Preferred Horizon Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK O18 — Office Full Timeline Fitted Plot
+
+office_h_num <- as.integer(substr(office_preferred_horizon, 1, 1))
+
+office_full_data <- office_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    time_index,
+    labor_hours,
+    labor_hours_lag = .data[[paste0("labor_hours_lag", office_h_num)]],
+    uspbs_lag = .data[[paste0("uspbs_lag", office_h_num)]],
+    tlnrescons_lag = .data[[paste0("tlnrescons_lag", office_h_num)]],
+    dgs10_lag = .data[[paste0("dgs10_lag", office_h_num)]],
+    pnfi_lag = .data[[paste0("pnfi_lag", office_h_num)]]
+  ) %>%
+  drop_na()
+
+office_baseline_full <- lm(
+  labor_hours ~ labor_hours_lag + time_index + qtr,
+  data = office_full_data
+)
+
+office_augmented_full <- lm(
+  labor_hours ~ labor_hours_lag + uspbs_lag + tlnrescons_lag + dgs10_lag + pnfi_lag + time_index + qtr,
+  data = office_full_data
+)
+
+office_full_plot_data <- office_full_data %>%
+  mutate(
+    baseline_fitted = predict(office_baseline_full, newdata = office_full_data),
+    augmented_fitted = predict(office_augmented_full, newdata = office_full_data)
+  ) %>%
+  select(quarter, labor_hours, baseline_fitted, augmented_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted, augmented_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted",
+      augmented_fitted = "Enhanced Fitted"
+    )
+  )
+
+ggplot(office_full_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.1) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Office Full Timeline: Actual vs Baseline vs Enhanced",
+    subtitle = "Historical Fitted Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK O19 — Office Seasonality Effects
+
+office_seasonality_summary <- tidy(
+  office_horizon_results[[office_preferred_horizon]]$baseline_model
+) %>%
+  filter(str_detect(term, "^qtr")) %>%
+  mutate(
+    quarter = recode(
+      term,
+      qtrQ2 = "Q2 vs Q1",
+      qtrQ3 = "Q3 vs Q1",
+      qtrQ4 = "Q4 vs Q1"
+    ),
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    ),
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    )
+  ) %>%
+  select(quarter, estimate, p.value, significance, direction)
+
+office_seasonality_summary %>%
+  mutate(
+    estimate = comma(round(estimate)),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Office Seasonality Effects (Reference Quarter = Q1)"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O20 — Office Final Indicator Story
+
+office_indicator_story <- tibble(
+  segment = "Office",
+  preferred_horizon = office_preferred_horizon,
+  variables_tested = "uspbs, tlnrescons, dgs10, pnfi",
+  variables_retained_or_most_useful = "uspbs (strongest), tlnrescons (cycle support), dgs10 and pnfi (supporting)",
+  key_story = "Office-related spending showed the clearest positive signal, and the broader macro specification performed best at longer horizons, especially at 4Q ahead.",
+  business_takeaway = "Office demand appears to benefit from macroeconomic signal more at longer horizons than at immediate short horizons, suggesting useful early warning potential around 4 quarters ahead."
+)
+
+office_indicator_story %>%
+  kable(
+    caption = "Office Final Indicator Story"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK O21 — Office Final Sector Summary
+
+office_final_summary <- tibble(
+  segment = "Office",
+  preferred_horizon = office_preferred_horizon,
+  baseline_rmse = office_forecast_error_summary %>%
+    filter(forecast_horizon == office_preferred_horizon) %>%
+    pull(baseline_RMSE),
+  enhanced_rmse = office_forecast_error_summary %>%
+    filter(forecast_horizon == office_preferred_horizon) %>%
+    pull(enhanced_RMSE),
+  rmse_lift_pct = office_forecast_error_summary %>%
+    filter(forecast_horizon == office_preferred_horizon) %>%
+    pull(RMSE_lift_pct),
+  baseline_mae = office_forecast_error_summary %>%
+    filter(forecast_horizon == office_preferred_horizon) %>%
+    pull(baseline_MAE),
+  enhanced_mae = office_forecast_error_summary %>%
+    filter(forecast_horizon == office_preferred_horizon) %>%
+    pull(enhanced_MAE),
+  mae_lift_pct = office_forecast_error_summary %>%
+    filter(forecast_horizon == office_preferred_horizon) %>%
+    pull(MAE_lift_pct),
+  baseline_r_squared = summary(office_horizon_results[[office_preferred_horizon]]$baseline_model)$adj.r.squared,
+  enhanced_r_squared = summary(office_horizon_results[[office_preferred_horizon]]$augmented_model)$adj.r.squared
+)
+
+office_final_summary %>%
+  mutate(
+    baseline_rmse = comma(round(baseline_rmse)),
+    enhanced_rmse = comma(round(enhanced_rmse)),
+    rmse_lift_pct = percent(rmse_lift_pct / 100, accuracy = 0.1),
+    baseline_mae = comma(round(baseline_mae)),
+    enhanced_mae = comma(round(enhanced_mae)),
+    mae_lift_pct = percent(mae_lift_pct / 100, accuracy = 0.1),
+    baseline_r_squared = round(baseline_r_squared, 3),
+    enhanced_r_squared = round(enhanced_r_squared, 3)
+  ) %>%
+  kable(
+    caption = "Office Final Sector Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M1 — Load Manufacturing External Files
+
+indpro_raw <- read_excel("INDPRO.xlsx", sheet = "Monthly") %>% clean_names()
+tcu_raw <- read_excel("TCU.xlsx", sheet = "Monthly") %>% clean_names()
+dgs10_man_raw <- read_excel("DGS10.xlsx", sheet = "Daily") %>% clean_names()
+pnfi_man_raw <- read_excel("PNFI.xlsx", sheet = "Quarterly") %>% clean_names()
+```
+
+```{r}
+# CHUNK M2 — Clean Manufacturing External Files
+
+indpro_clean <- indpro_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, indpro)
+
+tcu_clean <- tcu_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, tcu)
+
+dgs10_man_clean <- dgs10_man_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, dgs10)
+
+pnfi_man_clean <- pnfi_man_raw %>%
+  mutate(observation_date = ymd(observation_date)) %>%
+  select(observation_date, pnfi)
+```
+
+```{r}
+# CHUNK M3 — Build Manufacturing Internal Data
+
+man_jobs <- jobs_enriched %>%
+  filter(project_type == "MANUFACTURING") %>%
+  mutate(quarter = floor_date(true_start_date, "quarter"))
+
+man_job_starts_q <- man_jobs %>%
+  filter(!is.na(quarter)) %>%
+  group_by(quarter) %>%
+  summarise(
+    job_starts = n_distinct(job_id),
+    .groups = "drop"
+  )
+
+man_labor_q <- labor %>%
+  semi_join(
+    man_jobs %>% distinct(job_id),
+    by = "job_id"
+  ) %>%
+  mutate(
+    quarter = floor_date(work_date, "quarter")
+  ) %>%
+  filter(!is.na(quarter)) %>%
+  group_by(quarter) %>%
+  summarise(
+    labor_hours = sum(hrs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+man_quarterly <- man_job_starts_q %>%
+  full_join(man_labor_q, by = "quarter") %>%
+  arrange(quarter)
+
+man_quarterly
+```
+
+```{r}
+# CHUNK M4 — Define Time Range
+
+man_quarterly <- man_quarterly %>%
+  filter(quarter <= last_complete_quarter)
+
+min_q_man <- max(
+  floor_date(min(indpro_clean$observation_date), "quarter"),
+  floor_date(min(tcu_clean$observation_date), "quarter"),
+  floor_date(min(dgs10_man_clean$observation_date), "quarter"),
+  floor_date(min(pnfi_man_clean$observation_date), "quarter"),
+  min(man_quarterly$quarter)
+)
+
+max_q_man <- min(
+  max(man_quarterly$quarter),
+  last_complete_quarter
+)
+```
+
+```{r}
+# CHUNK M5 — Convert Manufacturing External Series to Quarterly
+
+to_q_man <- function(df, col, name) {
+  df %>%
+    mutate(quarter = floor_date(observation_date, "quarter")) %>%
+    group_by(quarter) %>%
+    summarise(value = mean(.data[[col]], na.rm = TRUE), .groups = "drop") %>%
+    rename(!!name := value) %>%
+    filter(quarter >= min_q_man, quarter <= max_q_man)
+}
+
+indpro_q <- to_q_man(indpro_clean, "indpro", "indpro")
+tcu_q <- to_q_man(tcu_clean, "tcu", "tcu")
+dgs10_man_q <- to_q_man(dgs10_man_clean, "dgs10", "dgs10")
+pnfi_man_q <- to_q_man(pnfi_man_clean, "pnfi", "pnfi")
+```
+
+```{r}
+# CHUNK M6 — Merge Manufacturing External Indicators
+
+man_external_q <- indpro_q %>%
+  full_join(tcu_q, by = "quarter") %>%
+  full_join(dgs10_man_q, by = "quarter") %>%
+  full_join(pnfi_man_q, by = "quarter") %>%
+  arrange(quarter)
+
+man_external_q
+```
+
+```{r}
+# CHUNK M7 — Final Manufacturing Model Data
+
+man_model_data <- man_quarterly %>%
+  filter(quarter >= min_q_man, quarter <= max_q_man) %>%
+  left_join(man_external_q, by = "quarter") %>%
+  arrange(quarter)
+
+glimpse(man_model_data)
+```
+
+```{r}
+# CHUNK M8 — Create Manufacturing Lag Variables + Time Index
+
+man_model_data <- man_model_data %>%
+  arrange(quarter) %>%
+  mutate(
+    qtr = factor(
+      paste0("Q", lubridate::quarter(quarter)),
+      levels = c("Q1", "Q2", "Q3", "Q4")
+    ),
+    time_index = row_number(),
+
+    labor_hours_lag1 = lag(labor_hours, 1),
+    labor_hours_lag2 = lag(labor_hours, 2),
+    labor_hours_lag3 = lag(labor_hours, 3),
+    labor_hours_lag4 = lag(labor_hours, 4),
+
+    indpro_lag1 = lag(indpro, 1),
+    indpro_lag2 = lag(indpro, 2),
+    indpro_lag3 = lag(indpro, 3),
+    indpro_lag4 = lag(indpro, 4),
+
+    tcu_lag1 = lag(tcu, 1),
+    tcu_lag2 = lag(tcu, 2),
+    tcu_lag3 = lag(tcu, 3),
+    tcu_lag4 = lag(tcu, 4),
+
+    dgs10_lag1 = lag(dgs10, 1),
+    dgs10_lag2 = lag(dgs10, 2),
+    dgs10_lag3 = lag(dgs10, 3),
+    dgs10_lag4 = lag(dgs10, 4),
+
+    pnfi_lag1 = lag(pnfi, 1),
+    pnfi_lag2 = lag(pnfi, 2),
+    pnfi_lag3 = lag(pnfi, 3),
+    pnfi_lag4 = lag(pnfi, 4)
+  )
+
+glimpse(man_model_data)
+```
+
+```{r}
+# CHUNK M9 — Manufacturing Horizon-Specific Forecasting Function
+
+fit_man_horizon_models <- function(data, horizon, test_periods = 4) {
+
+  horizon_data <- data %>%
+    transmute(
+      quarter,
+      qtr,
+      time_index,
+      labor_hours,
+      labor_hours_lag = .data[[paste0("labor_hours_lag", horizon)]],
+      indpro_lag = .data[[paste0("indpro_lag", horizon)]],
+      tcu_lag = .data[[paste0("tcu_lag", horizon)]],
+      dgs10_lag = .data[[paste0("dgs10_lag", horizon)]],
+      pnfi_lag = .data[[paste0("pnfi_lag", horizon)]]
+    ) %>%
+    drop_na()
+
+  n_obs <- nrow(horizon_data)
+
+  if (n_obs < 8) {
+    stop(paste("Not enough observations available for horizon", horizon))
+  }
+
+  test_n <- min(test_periods, max(2, floor(n_obs * 0.25)))
+  train_n <- n_obs - test_n
+
+  train_data <- horizon_data %>% slice(1:train_n)
+  test_data  <- horizon_data %>% slice((train_n + 1):n_obs)
+
+  baseline_model <- lm(
+    labor_hours ~ labor_hours_lag + time_index + qtr,
+    data = train_data
+  )
+
+  augmented_model <- lm(
+    labor_hours ~ labor_hours_lag +
+      indpro_lag +
+      tcu_lag +
+      dgs10_lag +
+      pnfi_lag +
+      time_index +
+      qtr,
+    data = train_data
+  )
+
+  test_predictions <- test_data %>%
+    mutate(
+      baseline_forecast = predict(baseline_model, newdata = test_data),
+      augmented_forecast = predict(augmented_model, newdata = test_data)
+    )
+
+  baseline_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$baseline_forecast
+  )
+
+  augmented_metrics <- calculate_error_metrics(
+    actual = test_predictions$labor_hours,
+    predicted = test_predictions$augmented_forecast
+  )
+
+  list(
+    horizon = horizon,
+    horizon_data = horizon_data,
+    train_data = train_data,
+    test_data = test_data,
+    baseline_model = baseline_model,
+    augmented_model = augmented_model,
+    predictions = test_predictions,
+    baseline_metrics = baseline_metrics,
+    augmented_metrics = augmented_metrics
+  )
+}
+```
+
+```{r}
+# CHUNK M10 — Run 1Q, 2Q, 3Q, and 4Q Ahead Manufacturing Models
+
+man_horizon_results <- list(
+  `1Q Ahead` = fit_man_horizon_models(man_model_data, horizon = 1),
+  `2Q Ahead` = fit_man_horizon_models(man_model_data, horizon = 2),
+  `3Q Ahead` = fit_man_horizon_models(man_model_data, horizon = 3),
+  `4Q Ahead` = fit_man_horizon_models(man_model_data, horizon = 4)
+)
+
+names(man_horizon_results)
+```
+
+```{r}
+# CHUNK M11 — Manufacturing Forecast Error Summary
+
+man_forecast_error_summary <- bind_rows(
+  lapply(names(man_horizon_results), function(h_name) {
+    result <- man_horizon_results[[h_name]]
+
+    tibble(
+      segment = "Manufacturing",
+      forecast_horizon = h_name,
+      baseline_MAE = result$baseline_metrics$MAE,
+      enhanced_MAE = result$augmented_metrics$MAE,
+      baseline_MAPE = result$baseline_metrics$MAPE,
+      enhanced_MAPE = result$augmented_metrics$MAPE,
+      baseline_RMSE = result$baseline_metrics$RMSE,
+      enhanced_RMSE = result$augmented_metrics$RMSE
+    )
+  })
+) %>%
+  mutate(
+    MAE_lift_pct = ((baseline_MAE - enhanced_MAE) / baseline_MAE) * 100,
+    MAPE_lift_pct = ((baseline_MAPE - enhanced_MAPE) / baseline_MAPE) * 100,
+    RMSE_lift_pct = ((baseline_RMSE - enhanced_RMSE) / baseline_RMSE) * 100
+  )
+
+man_forecast_error_summary %>%
+  mutate(
+    across(
+      c(baseline_MAE, enhanced_MAE, baseline_RMSE, enhanced_RMSE),
+      ~ comma(round(.))
+    ),
+    across(
+      c(baseline_MAPE, enhanced_MAPE, MAE_lift_pct, MAPE_lift_pct, RMSE_lift_pct),
+      ~ percent(. / 100, accuracy = 0.1)
+    )
+  ) %>%
+  kable(
+    caption = "Manufacturing Forecast Error Summary by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M12 — Manufacturing RMSE Comparison Plot by Horizon
+
+man_rmse_plot_data <- man_forecast_error_summary %>%
+  select(forecast_horizon, baseline_RMSE, enhanced_RMSE) %>%
+  pivot_longer(
+    cols = c(baseline_RMSE, enhanced_RMSE),
+    names_to = "model_type",
+    values_to = "RMSE"
+  ) %>%
+  mutate(
+    model_type = recode(
+      model_type,
+      baseline_RMSE = "Baseline",
+      enhanced_RMSE = "Enhanced"
+    ),
+    forecast_horizon = factor(
+      forecast_horizon,
+      levels = c("1Q Ahead", "2Q Ahead", "3Q Ahead", "4Q Ahead")
+    )
+  )
+
+ggplot(man_rmse_plot_data, aes(x = forecast_horizon, y = RMSE, fill = model_type)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Manufacturing RMSE by Forecast Horizon",
+    subtitle = "Baseline vs Enhanced Models",
+    x = "Forecast Horizon",
+    y = "RMSE",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK M13 — Manufacturing Regression Coefficients by Horizon
+
+man_coefficients_by_horizon <- bind_rows(
+  lapply(names(man_horizon_results), function(h_name) {
+    result <- man_horizon_results[[h_name]]
+
+    baseline_tidy <- tidy(result$baseline_model) %>%
+      mutate(
+        model_type = "Baseline",
+        forecast_horizon = h_name
+      )
+
+    augmented_tidy <- tidy(result$augmented_model) %>%
+      mutate(
+        model_type = "Augmented",
+        forecast_horizon = h_name
+      )
+
+    bind_rows(baseline_tidy, augmented_tidy)
+  })
+) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+man_coefficients_by_horizon %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Manufacturing Regression Coefficients by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M14 — Manufacturing Indicators Tested by Horizon
+
+man_indicator_tested_summary <- man_coefficients_by_horizon %>%
+  filter(
+    model_type == "Augmented",
+    !term %in% c("(Intercept)", "labor_hours_lag", "time_index"),
+    !str_detect(term, "^qtr")
+  ) %>%
+  mutate(
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    ),
+    included_in_final_model = if_else(p.value < 0.10, "Yes", "No")
+  ) %>%
+  select(
+    forecast_horizon,
+    indicator = term,
+    estimate,
+    p.value,
+    significance,
+    direction,
+    included_in_final_model
+  )
+
+man_indicator_tested_summary %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Manufacturing Indicators Tested by Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M15 — Manufacturing Preferred Forecast Horizon
+
+man_best_horizon_summary <- man_forecast_error_summary %>%
+  slice_max(RMSE_lift_pct, n = 1)
+
+man_best_horizon_summary %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    RMSE_lift_pct = percent(RMSE_lift_pct / 100, accuracy = 0.1),
+    baseline_MAE = comma(round(baseline_MAE)),
+    enhanced_MAE = comma(round(enhanced_MAE)),
+    MAE_lift_pct = percent(MAE_lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Manufacturing Preferred Forecast Horizon"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M16 — Manufacturing Quarter-by-Quarter Forecast Comparison
+
+man_preferred_horizon <- man_best_horizon_summary %>%
+  pull(forecast_horizon)
+
+man_final_predictions <- man_horizon_results[[man_preferred_horizon]]$predictions %>%
+  mutate(
+    baseline_abs_error = abs(labor_hours - baseline_forecast),
+    enhanced_abs_error = abs(labor_hours - augmented_forecast),
+    closer_model = case_when(
+      enhanced_abs_error < baseline_abs_error ~ "Enhanced",
+      baseline_abs_error < enhanced_abs_error ~ "Baseline",
+      TRUE ~ "Tie"
+    )
+  )
+
+man_final_predictions %>%
+  select(
+    quarter,
+    labor_hours,
+    baseline_forecast,
+    augmented_forecast,
+    baseline_abs_error,
+    enhanced_abs_error,
+    closer_model
+  ) %>%
+  mutate(
+    across(
+      c(labor_hours, baseline_forecast, augmented_forecast, baseline_abs_error, enhanced_abs_error),
+      ~ comma(round(.))
+    )
+  ) %>%
+  kable(
+    caption = "Manufacturing Quarter-by-Quarter Forecast Comparison"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M17 — Manufacturing Actual vs Predicted Plot
+
+man_plot_data <- man_final_predictions %>%
+  select(
+    quarter,
+    labor_hours,
+    baseline_forecast,
+    augmented_forecast
+  ) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_forecast, augmented_forecast),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_forecast = "Baseline Forecast",
+      augmented_forecast = "Enhanced Forecast"
+    )
+  )
+
+ggplot(man_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = paste0("Manufacturing ", man_preferred_horizon, " Forecast: Actual vs Predicted"),
+    subtitle = "Preferred Horizon Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK M18 — Manufacturing Full Timeline Fitted Plot
+
+man_h_num <- as.integer(substr(man_preferred_horizon, 1, 1))
+
+man_full_data <- man_model_data %>%
+  transmute(
+    quarter,
+    qtr,
+    time_index,
+    labor_hours,
+    labor_hours_lag = .data[[paste0("labor_hours_lag", man_h_num)]],
+    indpro_lag = .data[[paste0("indpro_lag", man_h_num)]],
+    tcu_lag = .data[[paste0("tcu_lag", man_h_num)]],
+    dgs10_lag = .data[[paste0("dgs10_lag", man_h_num)]],
+    pnfi_lag = .data[[paste0("pnfi_lag", man_h_num)]]
+  ) %>%
+  drop_na()
+
+man_baseline_full <- lm(
+  labor_hours ~ labor_hours_lag + time_index + qtr,
+  data = man_full_data
+)
+
+man_augmented_full <- lm(
+  labor_hours ~ labor_hours_lag + indpro_lag + tcu_lag + dgs10_lag + pnfi_lag + time_index + qtr,
+  data = man_full_data
+)
+
+man_full_plot_data <- man_full_data %>%
+  mutate(
+    baseline_fitted = predict(man_baseline_full, newdata = man_full_data),
+    augmented_fitted = predict(man_augmented_full, newdata = man_full_data)
+  ) %>%
+  select(quarter, labor_hours, baseline_fitted, augmented_fitted) %>%
+  pivot_longer(
+    cols = c(labor_hours, baseline_fitted, augmented_fitted),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(
+      series,
+      labor_hours = "Actual",
+      baseline_fitted = "Baseline Fitted",
+      augmented_fitted = "Enhanced Fitted"
+    )
+  )
+
+ggplot(man_full_plot_data,
+       aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 1.1) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Manufacturing Full Timeline: Actual vs Baseline vs Enhanced",
+    subtitle = "Historical Fitted Comparison",
+    x = "Quarter",
+    y = "Labor Hours",
+    color = "",
+    linetype = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# CHUNK M19 — Manufacturing Seasonality Effects
+
+man_seasonality_summary <- tidy(
+  man_horizon_results[[man_preferred_horizon]]$baseline_model
+) %>%
+  filter(str_detect(term, "^qtr")) %>%
+  mutate(
+    quarter = recode(
+      term,
+      qtrQ2 = "Q2 vs Q1",
+      qtrQ3 = "Q3 vs Q1",
+      qtrQ4 = "Q4 vs Q1"
+    ),
+    significance = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    ),
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    )
+  ) %>%
+  select(quarter, estimate, p.value, significance, direction)
+
+man_seasonality_summary %>%
+  mutate(
+    estimate = comma(round(estimate)),
+    p.value = round(p.value, 4)
+  ) %>%
+  kable(
+    caption = "Manufacturing Seasonality Effects (Reference Quarter = Q1)"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M20 — Manufacturing Final Indicator Story
+
+man_indicator_story <- tibble(
+  segment = "Manufacturing",
+  preferred_horizon = man_preferred_horizon,
+  variables_tested = "indpro, tcu, dgs10, pnfi",
+  variables_retained_or_most_useful = "dgs10 (most consistently significant), with indpro and tcu as industrial-cycle support",
+  key_story = "The broader macro specification performed best at longer horizons, especially at 4Q ahead. Interest rates were the most consistently significant individual signal across horizons, while industrial production and capacity utilization helped frame the broader manufacturing cycle.",
+  business_takeaway = "Manufacturing demand appears to respond strongly to macroeconomic conditions at longer horizons, suggesting useful early warning potential around 4 quarters ahead."
+)
+
+man_indicator_story %>%
+  kable(
+    caption = "Manufacturing Final Indicator Story"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK M21 — Manufacturing Final Sector Summary
+
+man_final_summary <- tibble(
+  segment = "Manufacturing",
+  preferred_horizon = man_preferred_horizon,
+  baseline_rmse = man_forecast_error_summary %>%
+    filter(forecast_horizon == man_preferred_horizon) %>%
+    pull(baseline_RMSE),
+  enhanced_rmse = man_forecast_error_summary %>%
+    filter(forecast_horizon == man_preferred_horizon) %>%
+    pull(enhanced_RMSE),
+  rmse_lift_pct = man_forecast_error_summary %>%
+    filter(forecast_horizon == man_preferred_horizon) %>%
+    pull(RMSE_lift_pct),
+  baseline_mae = man_forecast_error_summary %>%
+    filter(forecast_horizon == man_preferred_horizon) %>%
+    pull(baseline_MAE),
+  enhanced_mae = man_forecast_error_summary %>%
+    filter(forecast_horizon == man_preferred_horizon) %>%
+    pull(enhanced_MAE),
+  mae_lift_pct = man_forecast_error_summary %>%
+    filter(forecast_horizon == man_preferred_horizon) %>%
+    pull(MAE_lift_pct),
+  baseline_r_squared = summary(man_horizon_results[[man_preferred_horizon]]$baseline_model)$adj.r.squared,
+  enhanced_r_squared = summary(man_horizon_results[[man_preferred_horizon]]$augmented_model)$adj.r.squared
+)
+
+man_final_summary %>%
+  mutate(
+    baseline_rmse = comma(round(baseline_rmse)),
+    enhanced_rmse = comma(round(enhanced_rmse)),
+    rmse_lift_pct = percent(rmse_lift_pct / 100, accuracy = 0.1),
+    baseline_mae = comma(round(baseline_mae)),
+    enhanced_mae = comma(round(enhanced_mae)),
+    mae_lift_pct = percent(mae_lift_pct / 100, accuracy = 0.1),
+    baseline_r_squared = round(baseline_r_squared, 3),
+    enhanced_r_squared = round(enhanced_r_squared, 3)
+  ) %>%
+  kable(
+    caption = "Manufacturing Final Sector Summary"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+### =====================================================================
+## METHODOLOGY UPGRADE SECTION
+### =====================================================================
+
+In this section we re-fit every sector (Data Center, Warehouse, Apartment, Office, Manufacturing) using a pre-specified methodology and produce the single cross-sector table. The sector-specific chunks above are kept for continuity.
+
+#### What is this section includes:
+
+1. **Naive** (y_hat = labor_hours_lag-h at each horizon h) and **Seasonal Naive** (y_hat = labor_hours_lag4) benchmarks. We have to beat these first. If the Baseline doesn't beat the Naive, the problem is the target series itself, not the indicators.
+2. **COVID structural-break dummy** on the 2020 Q1–Q4 quarters, so the COVID shock isn't absorbed into other coefficients.
+3. **Warehouse outlier removal** (z-score > 2 on labor_hours): the 2017/2018 quarters we flagged at midterm.
+4. **Baseline = AR(1) + COVID** instead of AR(1) + qtr. Quarterly seasonal dummies were tested in every sector and were generally not significant; we keep them only in the Full Augmented model for reference.
+5. **Augmented Parsimonious (Levels)**: Baseline plus the single external indicator with the strongest |correlation| with labor_hours on the training set at that specific lag. The selection rule is pre-specified and applied uniformly across all sectors and horizons.
+6. **Augmented Parsimonious (Change-in)**: same, but using the quarterly first difference of the indicator. This is the fallback for sectors where labor_hours and the best indicator share a strong upward trend (Warehouse, Apartment).
+7. **Augmented Full**: all indicators + qtr + COVID (over the regressor budget, reference only).
+8. **Horizons extended to 1Q - 6Q**: The deck takes the longest horizon at which some Augmented variant beats the Baseline, with 3Q Ahead as the minimum actionable bar (Lithko's approval + mobilization cycle ≈ 2 quarters).
+9. **Honest no-signal fallback**: If no horizon 3Q to 6Q beats the Baseline in either variant, we report honestly: "no reliable early macro signal found in this dataset."
+
+```{r}
+# CHUNK U1 — Add COVID dummy to each sector model dataset
+
+add_covid_flag <- function(df) {
+  df %>%
+    mutate(
+      covid = as.integer(lubridate::year(quarter) == 2020)
+    )
+}
+
+dc_model_data        <- add_covid_flag(dc_model_data)
+warehouse_model_data <- add_covid_flag(warehouse_model_data)
+apartment_model_data <- add_covid_flag(apartment_model_data)
+office_model_data    <- add_covid_flag(office_model_data)
+man_model_data       <- add_covid_flag(man_model_data)
+```
+
+```{r}
+# CHUNK U2 — Remove warehouse outlier quarter
+warehouse_mean <- mean(warehouse_model_data$labor_hours, na.rm = TRUE)
+warehouse_sd   <- sd(warehouse_model_data$labor_hours, na.rm = TRUE)
+
+warehouse_outlier_quarters <- warehouse_model_data %>%
+  mutate(z_score = (labor_hours - warehouse_mean) / warehouse_sd) %>%
+  filter(abs(z_score) > 2) %>%
+  pull(quarter)
+
+warehouse_model_data <- warehouse_model_data %>%
+  filter(!(quarter %in% warehouse_outlier_quarters))
+
+cat("Warehouse outlier quarters removed (|z| > 2):",
+    length(warehouse_outlier_quarters), "\n")
+cat("Remaining warehouse quarters:", nrow(warehouse_model_data), "\n")
+```
+
+```{r}
+# CHUNK U3 — Rebuild lag1 to lag6 for labor hours and indicators
+
+create_lag_columns <- function(df, target_column, indicator_columns, horizons = 1:6) {
+  df <- df %>% arrange(quarter)
+
+  for (h in horizons) {
+    df[[paste0(target_column, "_lag", h)]] <- dplyr::lag(df[[target_column]], h)
+  }
+
+  for (indicator in indicator_columns) {
+    if (!indicator %in% names(df)) {
+      warning("Skipping ", indicator, " because it is not in this dataset.")
+      next
+    }
+
+    for (h in horizons) {
+      df[[paste0(indicator, "_lag", h)]] <- dplyr::lag(df[[indicator]], h)
+    }
+  }
+
+  df
+}
+
+dc_model_data <- create_lag_columns(
+  dc_model_data,
+  "labor_hours",
+  c("dc_spending", "pce_deflator", "tcu", "utility_production")
+)
+
+warehouse_model_data <- create_lag_columns(
+  warehouse_model_data,
+  "labor_hours",
+  c("ecom_sales", "pnfi", "tlnrescons", "indpro", "dgs10")
+)
+
+apartment_model_data <- create_lag_columns(
+  apartment_model_data,
+  "labor_hours",
+  c("permit5", "dgs10", "undcon5musa")
+)
+
+office_model_data <- create_lag_columns(
+  office_model_data,
+  "labor_hours",
+  c("uspbs", "tlnrescons", "dgs10", "pnfi")
+)
+
+man_model_data <- create_lag_columns(
+  man_model_data,
+  "labor_hours",
+  c("indpro", "tcu", "dgs10", "pnfi")
+)
+
+cat("Lag1 to Lag6 rebuilt with consistent names for all 5 sectors.\n")
+```
+
+```{r}
+# CHUNK U4 — Shared function to fit one sector at one horizon
+
+calculate_model_metrics <- function(actual, predicted) {
+  tibble(
+    MAE  = mean(abs(actual - predicted), na.rm = TRUE),
+    MAPE = mean(abs((actual - predicted) / actual) * 100, na.rm = TRUE),
+    RMSE = sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+  )
+}
+
+fit_sector_horizon_model <- function(df, horizon, indicator_names,
+                                     test_periods = 4, min_obs = 10) {
+
+  if (!"qtr" %in% names(df)) {
+    df <- df %>%
+      mutate(
+        qtr = factor(
+          paste0("Q", lubridate::quarter(quarter)),
+          levels = c("Q1", "Q2", "Q3", "Q4")
+        )
+      )
+  }
+
+  labor_lag_column <- paste0("labor_hours_lag", horizon)
+  seasonal_lag_column <- "labor_hours_lag4"
+  indicator_lag_columns <- paste0(indicator_names, "_lag", horizon)
+  indicator_change_columns <- paste0("d_", indicator_names, "_lag", horizon)
+
+  for (indicator in indicator_names) {
+    current_lag_col <- paste0(indicator, "_lag", horizon)
+    next_lag_col    <- paste0(indicator, "_lag", horizon + 1)
+    change_col      <- paste0("d_", indicator, "_lag", horizon)
+
+    if (next_lag_col %in% names(df)) {
+      df[[change_col]] <- df[[current_lag_col]] - df[[next_lag_col]]
+    } else {
+      df[[change_col]] <- df[[current_lag_col]] - dplyr::lag(df[[current_lag_col]], 1)
+    }
+  }
+
+  required_columns <- unique(c(
+    "quarter", "qtr", "covid", "labor_hours",
+    labor_lag_column, seasonal_lag_column,
+    indicator_lag_columns, indicator_change_columns
+  ))
+
+  missing_columns <- setdiff(required_columns, names(df))
+  if (length(missing_columns) > 0) {
+    warning(
+      "Missing columns for horizon ", horizon, ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+    return(NULL)
+  }
+
+  horizon_data <- df %>%
+    select(all_of(required_columns)) %>%
+    mutate(
+      labor_hours_lag = .data[[labor_lag_column]],
+      seasonal_labor_lag = .data[[seasonal_lag_column]]
+    ) %>%
+    drop_na()
+
+  if (nrow(horizon_data) < min_obs) {
+    return(NULL)
+  }
+
+  test_size <- min(test_periods, max(2, floor(nrow(horizon_data) * 0.25)))
+  train_size <- nrow(horizon_data) - test_size
+
+  train_data <- horizon_data %>% slice(1:train_size)
+  test_data  <- horizon_data %>% slice((train_size + 1):nrow(horizon_data))
+
+  available_level_indicators <- intersect(indicator_lag_columns, names(horizon_data))
+  available_change_indicators <- intersect(indicator_change_columns, names(horizon_data))
+
+  level_correlations <- sapply(available_level_indicators, function(col_name) {
+    suppressWarnings(cor(train_data$labor_hours, train_data[[col_name]], use = "complete.obs"))
+  })
+
+  best_level_column <- if (all(is.na(level_correlations))) {
+    available_level_indicators[1]
+  } else {
+    names(which.max(abs(level_correlations)))
+  }
+
+  best_level_indicator <- sub("_lag[0-9]+$", "", best_level_column)
+  best_level_correlation <- as.numeric(level_correlations[best_level_column])
+
+  change_correlations <- sapply(available_change_indicators, function(col_name) {
+    suppressWarnings(cor(train_data$labor_hours, train_data[[col_name]], use = "complete.obs"))
+  })
+
+  best_change_column <- if (all(is.na(change_correlations))) {
+    available_change_indicators[1]
+  } else {
+    names(which.max(abs(change_correlations)))
+  }
+
+  best_change_indicator <- sub("^d_", "", sub("_lag[0-9]+$", "", best_change_column))
+  best_change_correlation <- as.numeric(change_correlations[best_change_column])
+
+  baseline_model <- lm(labor_hours ~ labor_hours_lag + covid, data = train_data)
+
+  levels_formula <- as.formula(
+    paste("labor_hours ~ labor_hours_lag +", best_level_column, "+ covid")
+  )
+  levels_model <- lm(levels_formula, data = train_data)
+
+  change_formula <- as.formula(
+    paste("labor_hours ~ labor_hours_lag +", best_change_column, "+ covid")
+  )
+  change_model <- lm(change_formula, data = train_data)
+
+  full_formula <- as.formula(
+    paste(
+      "labor_hours ~ labor_hours_lag +",
+      paste(available_level_indicators, collapse = " + "),
+      "+ qtr + covid"
+    )
+  )
+  full_model <- lm(full_formula, data = train_data)
+
+  prediction_data <- test_data %>%
+    mutate(
+      naive_forecast = labor_hours_lag,
+      seasonal_naive_forecast = seasonal_labor_lag,
+      baseline_forecast = predict(baseline_model, newdata = test_data),
+      levels_forecast = predict(levels_model, newdata = test_data),
+      change_forecast = predict(change_model, newdata = test_data),
+      full_forecast = predict(full_model, newdata = test_data)
+    )
+
+  list(
+    horizon = horizon,
+    train_rows = train_size,
+    test_rows = nrow(test_data),
+    best_level_indicator = best_level_indicator,
+    best_level_correlation = best_level_correlation,
+    best_change_indicator = best_change_indicator,
+    best_change_correlation = best_change_correlation,
+    baseline_model = baseline_model,
+    levels_model = levels_model,
+    change_model = change_model,
+    full_model = full_model,
+    metrics = list(
+      naive = calculate_model_metrics(prediction_data$labor_hours, prediction_data$naive_forecast),
+      seasonal_naive = calculate_model_metrics(prediction_data$labor_hours, prediction_data$seasonal_naive_forecast),
+      baseline = calculate_model_metrics(prediction_data$labor_hours, prediction_data$baseline_forecast),
+      levels = calculate_model_metrics(prediction_data$labor_hours, prediction_data$levels_forecast),
+      change = calculate_model_metrics(prediction_data$labor_hours, prediction_data$change_forecast),
+      full = calculate_model_metrics(prediction_data$labor_hours, prediction_data$full_forecast)
+    )
+  )
+}
+```
+
+```{r}
+# CHUNK U5 — Run all sectors for horizons 1Q to 6Q
+
+sector_inputs <- list(
+  `Data Center` = list(
+    data = dc_model_data,
+    indicators = c("dc_spending", "pce_deflator", "tcu", "utility_production")
+  ),
+  `Warehouse` = list(
+    data = warehouse_model_data,
+    indicators = c("ecom_sales", "pnfi", "tlnrescons", "indpro", "dgs10")
+  ),
+  `Apartment` = list(
+    data = apartment_model_data,
+    indicators = c("permit5", "dgs10", "undcon5musa")
+  ),
+  `Office` = list(
+    data = office_model_data,
+    indicators = c("uspbs", "tlnrescons", "dgs10", "pnfi")
+  ),
+  `Manufacturing` = list(
+    data = man_model_data,
+    indicators = c("indpro", "tcu", "dgs10", "pnfi")
+  )
+)
+
+horizons_to_test <- 1:6
+
+all_sector_results <- lapply(names(sector_inputs), function(sector_name) {
+  sector_info <- sector_inputs[[sector_name]]
+
+  results_by_horizon <- lapply(horizons_to_test, function(h) {
+    fit_sector_horizon_model(
+      df = sector_info$data,
+      horizon = h,
+      indicator_names = sector_info$indicators
+    )
+  })
+
+  names(results_by_horizon) <- paste0(horizons_to_test, "Q Ahead")
+  results_by_horizon
+})
+
+names(all_sector_results) <- names(sector_inputs)
+```
+
+```{r}
+# CHUNK U6 — Full benchmark summary across all sectors and horizons
+
+benchmark_summary <- bind_rows(
+  lapply(names(all_sector_results), function(sector_name) {
+    bind_rows(
+      lapply(names(all_sector_results[[sector_name]]), function(horizon_name) {
+        result <- all_sector_results[[sector_name]][[horizon_name]]
+
+        if (is.null(result)) {
+          return(NULL)
+        }
+
+        tibble(
+          segment = sector_name,
+          forecast_horizon = horizon_name,
+          naive_RMSE = result$metrics$naive$RMSE,
+          seasonal_naive_RMSE = result$metrics$seasonal_naive$RMSE,
+          baseline_RMSE = result$metrics$baseline$RMSE,
+          augmented_levels_RMSE = result$metrics$levels$RMSE,
+          augmented_change_RMSE = result$metrics$change$RMSE,
+          augmented_full_RMSE = result$metrics$full$RMSE,
+          baseline_MAPE = result$metrics$baseline$MAPE,
+          augmented_levels_MAPE = result$metrics$levels$MAPE,
+          augmented_change_MAPE = result$metrics$change$MAPE,
+          augmented_full_MAPE = result$metrics$full$MAPE
+        )
+      })
+    )
+  })
+)
+
+benchmark_summary %>%
+  mutate(
+    across(ends_with("_RMSE"), ~ comma(round(.))),
+    across(ends_with("_MAPE"), ~ percent(. / 100, accuracy = 0.1))
+  ) %>%
+  kable(
+    caption = "Benchmark Summary: Naive / Seasonal Naive / Baseline / Augmented Levels / Augmented Change-in / Augmented Full"
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  scroll_box(height = "480px")
+```
+
+```{r}
+# CHUNK U7 — Pick best deck-ready model for each sector
+
+candidate_horizons <- c("6Q Ahead", "5Q Ahead", "4Q Ahead", "3Q Ahead")
+acceptable_mape <- 30
+
+pick_best_sector_model <- function(sector_results) {
+  valid_candidates <- list()
+
+  for (horizon_name in candidate_horizons) {
+    result <- sector_results[[horizon_name]]
+    if (is.null(result)) next
+
+    baseline_rmse <- result$metrics$baseline$RMSE
+    if (is.na(baseline_rmse)) next
+
+    for (model_type in c("Levels", "Change-in", "Full")) {
+      metric_key <- switch(
+        model_type,
+        "Levels" = "levels",
+        "Change-in" = "change",
+        "Full" = "full"
+      )
+
+      candidate_rmse <- result$metrics[[metric_key]]$RMSE
+      candidate_mape <- result$metrics[[metric_key]]$MAPE
+
+      if (is.na(candidate_rmse) || is.na(candidate_mape)) next
+
+      if (candidate_rmse < baseline_rmse && candidate_mape <= acceptable_mape) {
+        valid_candidates[[length(valid_candidates) + 1]] <- list(
+          horizon = horizon_name,
+          horizon_number = as.integer(sub("Q Ahead", "", horizon_name)),
+          variant = model_type,
+          mape = candidate_mape,
+          rmse = candidate_rmse
+        )
+      }
+    }
+  }
+
+  if (length(valid_candidates) == 0) {
+    return(list(horizon = NA_character_, variant = NA_character_))
+  }
+
+  valid_candidates <- valid_candidates[
+    order(
+      sapply(valid_candidates, `[[`, "mape"),
+      -sapply(valid_candidates, `[[`, "horizon_number")
+    )
+  ]
+
+  best_candidate <- valid_candidates[[1]]
+
+  list(
+    horizon = best_candidate$horizon,
+    variant = best_candidate$variant
+  )
+}
+
+sector_picks <- lapply(names(all_sector_results), function(sector_name) {
+  selected_model <- pick_best_sector_model(all_sector_results[[sector_name]])
+
+  list(
+    segment = sector_name,
+    horizon = selected_model$horizon,
+    variant = selected_model$variant
+  )
+})
+
+sector_picks_df <- bind_rows(lapply(sector_picks, as_tibble))
+sector_picks_df
+```
+
+```{r}
+# CHUNK U8 — Cross-sector deck summary
+
+deck_summary <- bind_rows(
+  lapply(seq_along(sector_picks), function(i) {
+    sector_name <- sector_picks[[i]]$segment
+    selected_horizon <- sector_picks[[i]]$horizon
+    selected_model_type <- sector_picks[[i]]$variant
+
+    if (is.na(selected_horizon)) {
+      return(
+        tibble(
+          segment = sector_name,
+          picked_horizon = "No actionable signal (3Q-6Q, MAPE ≤ 30%)",
+          winning_model = "—",
+          indicator_used = "—",
+          baseline_RMSE = NA_real_,
+          augmented_RMSE = NA_real_,
+          lift_vs_baseline_pct = NA_real_,
+          augmented_MAPE_pct = NA_real_
+        )
+      )
+    }
+
+    result <- all_sector_results[[sector_name]][[selected_horizon]]
+    baseline_rmse <- result$metrics$baseline$RMSE
+
+    if (selected_model_type == "Levels") {
+      augmented_rmse <- result$metrics$levels$RMSE
+      augmented_mape <- result$metrics$levels$MAPE
+      selected_indicator <- result$best_level_indicator
+
+    } else if (selected_model_type == "Change-in") {
+      augmented_rmse <- result$metrics$change$RMSE
+      augmented_mape <- result$metrics$change$MAPE
+      selected_indicator <- paste0("d_", result$best_change_indicator)
+
+    } else {
+      augmented_rmse <- result$metrics$full$RMSE
+      augmented_mape <- result$metrics$full$MAPE
+      selected_indicator <- "all indicators (Full spec)"
+    }
+
+    tibble(
+      segment = sector_name,
+      picked_horizon = selected_horizon,
+      winning_model = selected_model_type,
+      indicator_used = selected_indicator,
+      baseline_RMSE = baseline_rmse,
+      augmented_RMSE = augmented_rmse,
+      lift_vs_baseline_pct = (baseline_rmse - augmented_rmse) / baseline_rmse * 100,
+      augmented_MAPE_pct = augmented_mape
+    )
+  })
+)
+
+deck_summary %>%
+  mutate(
+    baseline_RMSE = ifelse(is.na(baseline_RMSE), "—", comma(round(baseline_RMSE))),
+    augmented_RMSE = ifelse(is.na(augmented_RMSE), "—", comma(round(augmented_RMSE))),
+    lift_vs_baseline_pct = ifelse(
+      is.na(lift_vs_baseline_pct),
+      "—",
+      percent(lift_vs_baseline_pct / 100, accuracy = 0.1)
+    ),
+    augmented_MAPE_pct = ifelse(
+      is.na(augmented_MAPE_pct),
+      "—",
+      percent(augmented_MAPE_pct / 100, accuracy = 0.1)
+    )
+  ) %>%
+  kable(
+    caption = "Deck-Ready Cross-Sector Summary (MAPE ≤ 30%, longer horizon used as tiebreak)"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK U9 — Indicator audit trail
+
+indicator_audit <- bind_rows(
+  lapply(names(all_sector_results), function(sector_name) {
+    bind_rows(
+      lapply(names(all_sector_results[[sector_name]]), function(horizon_name) {
+        result <- all_sector_results[[sector_name]][[horizon_name]]
+
+        if (is.null(result)) {
+          return(NULL)
+        }
+
+        tibble(
+          segment = sector_name,
+          forecast_horizon = horizon_name,
+          levels_indicator = result$best_level_indicator,
+          levels_correlation = round(result$best_level_correlation, 3),
+          changein_indicator = result$best_change_indicator,
+          changein_correlation = round(result$best_change_correlation, 3)
+        )
+      })
+    )
+  })
+)
+
+indicator_audit %>%
+  kable(
+    caption = "Auto-Selected Indicator at Each Sector and Horizon (Levels + Change-in)"
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  scroll_box(height = "420px")
+```
+
+```{r}
+# CHUNK U-MATRIX — Sector x Horizon Out-Of-Sample MAPE Grid
+
+get_best_mape <- function(sector_name, horizon_name) {
+  result <- all_sector_results[[sector_name]][[horizon_name]]
+
+  best_mape <- min(
+    result$metrics$levels$MAPE,
+    result$metrics$change$MAPE,
+    result$metrics$full$MAPE,
+    na.rm = TRUE
+  )
+
+  return(best_mape)
+}
+
+sector_horizon_mape <- tibble(
+  Sector = c("Data Center", "Warehouse", "Apartment", "Office", "Manufacturing"),
+
+  `1Q` = c(
+    get_best_mape("Data Center", "1Q Ahead"),
+    get_best_mape("Warehouse", "1Q Ahead"),
+    get_best_mape("Apartment", "1Q Ahead"),
+    get_best_mape("Office", "1Q Ahead"),
+    get_best_mape("Manufacturing", "1Q Ahead")
+  ),
+
+  `2Q` = c(
+    get_best_mape("Data Center", "2Q Ahead"),
+    get_best_mape("Warehouse", "2Q Ahead"),
+    get_best_mape("Apartment", "2Q Ahead"),
+    get_best_mape("Office", "2Q Ahead"),
+    get_best_mape("Manufacturing", "2Q Ahead")
+  ),
+
+  `3Q` = c(
+    get_best_mape("Data Center", "3Q Ahead"),
+    get_best_mape("Warehouse", "3Q Ahead"),
+    get_best_mape("Apartment", "3Q Ahead"),
+    get_best_mape("Office", "3Q Ahead"),
+    get_best_mape("Manufacturing", "3Q Ahead")
+  ),
+
+  `4Q` = c(
+    get_best_mape("Data Center", "4Q Ahead"),
+    get_best_mape("Warehouse", "4Q Ahead"),
+    get_best_mape("Apartment", "4Q Ahead"),
+    get_best_mape("Office", "4Q Ahead"),
+    get_best_mape("Manufacturing", "4Q Ahead")
+  ),
+
+  `5Q` = c(
+    get_best_mape("Data Center", "5Q Ahead"),
+    get_best_mape("Warehouse", "5Q Ahead"),
+    get_best_mape("Apartment", "5Q Ahead"),
+    get_best_mape("Office", "5Q Ahead"),
+    get_best_mape("Manufacturing", "5Q Ahead")
+  ),
+
+  `6Q` = c(
+    get_best_mape("Data Center", "6Q Ahead"),
+    get_best_mape("Warehouse", "6Q Ahead"),
+    get_best_mape("Apartment", "6Q Ahead"),
+    get_best_mape("Office", "6Q Ahead"),
+    get_best_mape("Manufacturing", "6Q Ahead")
+  )
+)
+
+sector_horizon_mape_display <- sector_horizon_mape %>%
+  mutate(
+    `1Q` = "—",
+    `2Q` = "—",
+    `3Q` = ifelse(`3Q` > 30, ">30%", paste0(round(`3Q`, 1), "%")),
+    `4Q` = ifelse(`4Q` > 30, ">30%", paste0(round(`4Q`, 1), "%")),
+    `5Q` = ifelse(`5Q` > 30, ">30%", paste0(round(`5Q`, 1), "%")),
+    `6Q` = ifelse(`6Q` > 30, ">30%", paste0(round(`6Q`, 1), "%"))
+  )
+
+sector_horizon_mape_display %>%
+  kable(
+    caption = "Sector x Horizon Out-of-Sample MAPE"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# CHUNK U10 — Honest findings text
+
+cat("=== Honest Findings (MAPE ≤ 30% rule) ===\n\n")
+
+for (i in seq_along(sector_picks)) {
+  sector_name <- sector_picks[[i]]$segment
+  selected_horizon <- sector_picks[[i]]$horizon
+  selected_model_type <- sector_picks[[i]]$variant
+
+  if (is.na(selected_horizon)) {
+    cat(
+      "**", sector_name, "**: No actionable signal at horizons 3Q-6Q with MAPE ≤ 30%.\n",
+      "None of the augmented models met the planning-quality threshold.\n",
+      "Recommendation: use the Baseline AR(1)+COVID forecast and report wider uncertainty.\n\n",
+      sep = ""
+    )
+  } else {
+    result <- all_sector_results[[sector_name]][[selected_horizon]]
+
+    augmented_rmse <- switch(
+      selected_model_type,
+      "Levels" = result$metrics$levels$RMSE,
+      "Change-in" = result$metrics$change$RMSE,
+      "Full" = result$metrics$full$RMSE
+    )
+
+    augmented_mape <- switch(
+      selected_model_type,
+      "Levels" = result$metrics$levels$MAPE,
+      "Change-in" = result$metrics$change$MAPE,
+      "Full" = result$metrics$full$MAPE
+    )
+
+    selected_indicator <- switch(
+      selected_model_type,
+      "Levels" = result$best_level_indicator,
+      "Change-in" = paste0("d_", result$best_change_indicator),
+      "Full" = "all indicators (Full spec)"
+    )
+
+    lift_pct <- (result$metrics$baseline$RMSE - augmented_rmse) /
+      result$metrics$baseline$RMSE * 100
+
+    cat(
+      "**", sector_name, "**: Deck horizon = ", selected_horizon, " (", selected_model_type, ").\n",
+      "Indicator(s): ", selected_indicator,
+      ". Lift vs Baseline: ", sprintf("%.1f", lift_pct), "%.",
+      " Aug MAPE: ", sprintf("%.1f", augmented_mape), "%.\n\n",
+      sep = ""
+    )
+  }
+}
+```
+
+#### How to read this summary
+The table above shows the best model chosen for each sector using a pre-specified rule applied uniformly across all sectors and horizons:
+**Two filters:**
+1. Augmented must beat Baseline on RMSE: if no Augmented variant (Levels / Change-in / Full) improves out-of-sample fit, the sector reverts to baseline-only.
+2. MAPE ≤ 30%: any surviving horizon above this planning-quality threshold is dropped.
+
+**Sort among survivors:**
+3. Lowest MAPE wins among the surviving 3Q to 6Q candidates.
+4. Longer horizon as tie-breaker, more lead time for Lithko's planning cycle.
+
+If a sector does not satisfy filters 1 and 2 at any 3Q to 6Q horizon, it is labeled No actionable signal. The external indicators did not improve forecasting enough to support planning decisions at this stage.
+
+#### Additional testing for Office and Apartment
+The next three chunks focus only on Office and Apartment, because these were the weakest sectors in the earlier results. We test two practical improvements:
+
+1. **post_2020 shift variable**: a dummy variable equal to 1 from 2020 onward. It helps capture a lasting structural change that the one-year COVID dummy may miss.
+2. **log transform of labor hours**: helps when labor hours vary a lot over time. It can reduce forecast error and improve stability. After prediction, the values are converted back to labor hours so the results stay easy to interpret.
+
+```{r}
+# CHUNK U11A — Enhanced fit function for Office and Apartment
+
+fit_sector_horizon_enhanced <- function(df, horizon, indicator_names,
+                                        test_periods = 4, min_obs = 10,
+                                        use_log = FALSE,
+                                        add_post_2020_shift = TRUE) {
+
+  if (!"qtr" %in% names(df)) {
+    df <- df %>%
+      mutate(
+        qtr = factor(
+          paste0("Q", lubridate::quarter(quarter)),
+          levels = c("Q1", "Q2", "Q3", "Q4")
+        )
+      )
+  }
+
+  df <- df %>%
+    mutate(
+      post_2020 = as.integer(lubridate::year(quarter) >= 2020)
+    )
+
+  labor_lag_column <- paste0("labor_hours_lag", horizon)
+  seasonal_lag_column <- "labor_hours_lag4"
+  indicator_lag_columns <- paste0(indicator_names, "_lag", horizon)
+
+  required_columns <- unique(c(
+    "quarter", "qtr", "covid", "post_2020",
+    "labor_hours", labor_lag_column, seasonal_lag_column,
+    indicator_lag_columns
+  ))
+
+  missing_columns <- setdiff(required_columns, names(df))
+  if (length(missing_columns) > 0) {
+    return(NULL)
+  }
+
+  horizon_data <- df %>%
+    select(all_of(required_columns)) %>%
+    mutate(
+      labor_hours_lag = .data[[labor_lag_column]],
+      seasonal_labor_lag = .data[[seasonal_lag_column]],
+      y_target = if (use_log) log(labor_hours + 1) else labor_hours,
+      y_target_lag = if (use_log) log(.data[[labor_lag_column]] + 1) else .data[[labor_lag_column]]
+    ) %>%
+    drop_na()
+
+  if (nrow(horizon_data) < min_obs) {
+    return(NULL)
+  }
+
+  test_size <- min(test_periods, max(2, floor(nrow(horizon_data) * 0.25)))
+  train_size <- nrow(horizon_data) - test_size
+
+  train_data <- horizon_data %>% slice(1:train_size)
+  test_data  <- horizon_data %>% slice((train_size + 1):nrow(horizon_data))
+
+  available_indicators <- intersect(indicator_lag_columns, names(horizon_data))
+
+  baseline_formula_text <- if (add_post_2020_shift) {
+    "y_target ~ y_target_lag + covid + post_2020"
+  } else {
+    "y_target ~ y_target_lag + covid"
+  }
+
+  baseline_model <- lm(as.formula(baseline_formula_text), data = train_data)
+
+  full_formula_text <- paste(
+    baseline_formula_text, "+",
+    paste(available_indicators, collapse = " + "),
+    "+ qtr"
+  )
+
+  full_model <- lm(as.formula(full_formula_text), data = train_data)
+
+  prediction_data <- test_data %>%
+    mutate(
+      baseline_transformed = predict(baseline_model, newdata = test_data),
+      full_transformed = predict(full_model, newdata = test_data),
+      baseline_forecast = if (use_log) exp(baseline_transformed) - 1 else baseline_transformed,
+      full_forecast = if (use_log) exp(full_transformed) - 1 else full_transformed
+    )
+
+  list(
+    horizon = horizon,
+    use_log = use_log,
+    add_post_2020_shift = add_post_2020_shift,
+    metrics = list(
+      baseline = calculate_model_metrics(prediction_data$labor_hours, prediction_data$baseline_forecast),
+      full = calculate_model_metrics(prediction_data$labor_hours, prediction_data$full_forecast)
+    )
+  )
+}
+```
+
+```{r}
+# CHUNK U11B — Run enhancement combinations for Office and Apartment
+
+enhancement_options <- list(
+  list(use_log = FALSE, add_post_2020_shift = FALSE, label = "standard model"),
+  list(use_log = FALSE, add_post_2020_shift = TRUE,  label = "add post_2020 shift"),
+  list(use_log = TRUE,  add_post_2020_shift = FALSE, label = "log transform only"),
+  list(use_log = TRUE,  add_post_2020_shift = TRUE,  label = "log transform + post_2020 shift")
+)
+
+run_sector_enhancements <- function(sector_name, df, indicators) {
+  bind_rows(
+    lapply(horizons_to_test, function(h) {
+      bind_rows(
+        lapply(enhancement_options, function(option) {
+          result <- tryCatch(
+            fit_sector_horizon_enhanced(
+              df = df,
+              horizon = h,
+              indicator_names = indicators,
+              use_log = option$use_log,
+              add_post_2020_shift = option$add_post_2020_shift
+            ),
+            error = function(err) NULL
+          )
+
+          if (is.null(result)) {
+            return(NULL)
+          }
+
+          tibble(
+            segment = sector_name,
+            horizon = paste0(h, "Q Ahead"),
+            enhancement = option$label,
+            baseline_RMSE = result$metrics$baseline$RMSE,
+            full_RMSE = result$metrics$full$RMSE,
+            baseline_MAPE = result$metrics$baseline$MAPE,
+            full_MAPE = result$metrics$full$MAPE,
+            lift_pct = (result$metrics$baseline$RMSE - result$metrics$full$RMSE) /
+              result$metrics$baseline$RMSE * 100
+          )
+        })
+      )
+    })
+  )
+}
+
+office_enhancement_results <- run_sector_enhancements(
+  "Office",
+  office_model_data,
+  c("uspbs", "tlnrescons", "dgs10", "pnfi")
+)
+
+apartment_enhancement_results <- run_sector_enhancements(
+  "Apartment",
+  apartment_model_data,
+  c("permit5", "dgs10", "undcon5musa")
+)
+
+enhancement_summary <- bind_rows(
+  office_enhancement_results,
+  apartment_enhancement_results
+)
+
+enhancement_summary %>%
+  filter(horizon %in% candidate_horizons) %>%
+  mutate(
+    across(ends_with("_RMSE"), ~ comma(round(.))),
+    across(ends_with("_MAPE"), ~ percent(. / 100, accuracy = 0.1)),
+    lift_pct = percent(lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Office and Apartment Enhancement Experiments (3Q-6Q)"
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  scroll_box(height = "520px")
+```
+
+```{r}
+# CHUNK U11C — Pick best enhancement for Office and Apartment
+
+pick_best_enhancement <- function(sector_data) {
+  candidates <- sector_data %>%
+    filter(horizon %in% candidate_horizons) %>%
+    filter(full_RMSE < baseline_RMSE, full_MAPE <= acceptable_mape) %>%
+    arrange(full_MAPE, desc(as.integer(substr(horizon, 1, 1))))
+
+  if (nrow(candidates) == 0) {
+    return(NULL)
+  }
+
+  candidates %>% slice(1)
+}
+
+best_enhancement_summary <- bind_rows(
+  office_enhancement_results %>% pick_best_enhancement(),
+  apartment_enhancement_results %>% pick_best_enhancement()
+)
+
+if (nrow(best_enhancement_summary) > 0) {
+  best_enhancement_summary %>%
+    select(
+      segment, horizon, enhancement,
+      baseline_RMSE, full_RMSE, lift_pct, full_MAPE
+    ) %>%
+    mutate(
+      baseline_RMSE = comma(round(baseline_RMSE)),
+      full_RMSE = comma(round(full_RMSE)),
+      lift_pct = percent(lift_pct / 100, accuracy = 0.1),
+      full_MAPE = percent(full_MAPE / 100, accuracy = 0.1)
+    ) %>%
+    kable(
+      caption = "Best Enhancement Winner for Office and Apartment"
+    ) %>%
+    kable_styling(full_width = FALSE)
+} else {
+  cat(
+    "Neither Office nor Apartment has an enhancement that meets the MAPE ≤ 30% rule at 3Q-6Q.\n",
+    "Recommendation: report them as no actionable external-indicator signal.\n",
+    sep = ""
+  )
+}
+```
+
+### How to read the deck summary
+
+1. **Data Center** picks 5Q Ahead via Aug Full (dc_spending_lag + the other three indicators): MAPE 7.5%, lift 80.1% vs Baseline. 3Q also clears the 30% threshold (MAPE 7.6%) but 5Q wins on lower MAPE and offers a longer planning horizon.
+2. **Warehouse** picks 6Q Ahead via Aug Full: MAPE 21.2%, lift 39.7%. The Levels spec overfits because of trend collinearity; Full recovers.
+3. **Apartment** picks 4Q Ahead via Aug Levels (undcon5musa_lag4): MAPE 9.7%, lift 23.7%. The named indicator has the strongest correlation at this horizon but is not individually significant in the regression — the AR(1) term and COVID dummy do most of the explanatory work. We still report 4Q because it clears the 30% bar and produces the lowest out-of-sample error.
+4. **Office** is the weakest sector: short history, low labor-hours-vs-indicator correlation. No spec at any 3Q–6Q horizon meets the 30% cap. The deck reports this as "signal too weak to plan against at current data depth" — an honest finding, not a failure.
+5. **Manufacturing** picks 5Q Ahead via Aug Levels (pnfi_lag5): MAPE 5.1%, lift 83.8%. 6Q also clears 30% (MAPE 10.8%); 5Q wins on lower MAPE.
+
+### Additional Warehouse Testing
+
+The next three chunks test whether Warehouse performance can be improved further:
+
+1. **Outlier rule**: compare the current warehouse outlier rule with a tighter version.
+2. **Target transform**: compare regular labor-hours modeling with a log-transformed version.
+3. **Structural break**: test whether adding a post-2020 shift improves warehouse forecasts.
+
+```{r}
+# CHUNK U13A — Build tighter warehouse outlier version
+
+warehouse_mean_tight <- mean(warehouse_model_data$labor_hours, na.rm = TRUE)
+warehouse_sd_tight   <- sd(warehouse_model_data$labor_hours, na.rm = TRUE)
+
+warehouse_extra_outlier_quarters <- warehouse_model_data %>%
+  mutate(z_score = (labor_hours - warehouse_mean_tight) / warehouse_sd_tight) %>%
+  filter(abs(z_score) > 1.5) %>%
+  pull(quarter)
+
+cat("Tighter warehouse outlier rule (|z| > 1.5) removes",
+    length(warehouse_extra_outlier_quarters), "quarters:\n")
+print(warehouse_extra_outlier_quarters)
+
+warehouse_model_data_tight <- warehouse_model_data %>%
+  filter(!(quarter %in% warehouse_extra_outlier_quarters))
+
+cat("\nWarehouse rows after tighter rule:", nrow(warehouse_model_data_tight), "\n")
+```
+
+```{r}
+# CHUNK U13B — Run warehouse boost experiments
+
+warehouse_indicators <- c("ecom_sales", "pnfi", "tlnrescons", "indpro", "dgs10")
+
+warehouse_boost_default <- run_sector_enhancements(
+  "Warehouse (2 SD cutoff)",
+  warehouse_model_data,
+  warehouse_indicators
+) %>%
+  mutate(outlier_rule = "2 SD cutoff")
+
+warehouse_boost_tight <- run_sector_enhancements(
+  "Warehouse (1.5 SD cutoff)",
+  warehouse_model_data_tight,
+  warehouse_indicators
+) %>%
+  mutate(outlier_rule = "1.5 SD cutoff")
+
+warehouse_boost_results <- bind_rows(
+  warehouse_boost_default,
+  warehouse_boost_tight
+) %>%
+  filter(horizon %in% candidate_horizons) %>%
+  select(
+    segment, outlier_rule, horizon, enhancement,
+    baseline_RMSE, full_RMSE, baseline_MAPE, full_MAPE, lift_pct
+  )
+
+warehouse_boost_results %>%
+  mutate(
+    across(ends_with("_RMSE"), ~ comma(round(.))),
+    across(ends_with("_MAPE"), ~ percent(. / 100, accuracy = 0.1)),
+    lift_pct = percent(lift_pct / 100, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption = "Warehouse Accuracy Boost Experiments"
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  scroll_box(height = "600px")
+```
+
+```{r}
+# CHUNK U13C — Pick best warehouse boost
+
+warehouse_boost_candidates <- warehouse_boost_results %>%
+  filter(full_RMSE < baseline_RMSE, full_MAPE <= acceptable_mape) %>%
+  arrange(full_MAPE, desc(as.integer(substr(horizon, 1, 1))))
+
+cat("=== Warehouse candidates that beat baseline and meet MAPE ≤ 30% ===\n\n")
+
+if (nrow(warehouse_boost_candidates) > 0) {
+  warehouse_boost_candidates %>%
+    mutate(
+      baseline_RMSE = comma(round(baseline_RMSE)),
+      full_RMSE = comma(round(full_RMSE)),
+      lift_pct = percent(lift_pct / 100, accuracy = 0.1),
+      full_MAPE = percent(full_MAPE / 100, accuracy = 0.1),
+      baseline_MAPE = percent(baseline_MAPE / 100, accuracy = 0.1)
+    ) %>%
+    select(
+      horizon, outlier_rule, enhancement,
+      baseline_RMSE, full_RMSE, lift_pct, full_MAPE
+    ) %>%
+    kable(
+      caption = "Warehouse Boost Candidates"
+    ) %>%
+    kable_styling(full_width = FALSE)
+} else {
+  cat("No warehouse boost version beats baseline and meets MAPE ≤ 30%.\n")
+}
+
+warehouse_reference_rmse <- 113900
+warehouse_reference_lift <- 39.7
+warehouse_reference_mape <- 21.2
+
+cat("\n=== Warehouse reference from earlier summary: 6Q Full, lift 39.7%, MAPE 21.2% ===\n")
+
+if (nrow(warehouse_boost_candidates) > 0) {
+  best_candidate <- warehouse_boost_candidates %>% slice(1)
+
+  cat("Top warehouse candidate:\n")
+  cat("  Horizon      :", best_candidate$horizon, "\n")
+  cat("  Outlier rule :", best_candidate$outlier_rule, "\n")
+  cat("  Enhancement  :", best_candidate$enhancement, "\n")
+  cat("  Full RMSE    :", comma(round(best_candidate$full_RMSE)),
+      " (reference:", comma(warehouse_reference_rmse), ")\n")
+  cat("  Lift         :", sprintf("%.1f%%", best_candidate$lift_pct),
+      " (reference:", sprintf("%.1f%%", warehouse_reference_lift), ")\n")
+  cat("  Full MAPE    :", sprintf("%.1f%%", best_candidate$full_MAPE),
+      " (reference:", sprintf("%.1f%%", warehouse_reference_mape), ")\n")
+
+  mape_difference <- warehouse_reference_mape - best_candidate$full_MAPE
+  lift_difference <- best_candidate$lift_pct - warehouse_reference_lift
+
+  cat("\n  MAPE improvement vs reference: ", sprintf("%+.1f pp", -mape_difference), "\n", sep = "")
+  cat("  Lift improvement vs reference: ", sprintf("%+.1f pp", lift_difference), "\n", sep = "")
+
+  if (mape_difference > 0 && lift_difference > 0) {
+    cat("\n  VERDICT: New warehouse version is better on both MAPE and lift. Use this in the deck.\n")
+  } else if (mape_difference > 0) {
+    cat("\n  VERDICT: New warehouse version improves MAPE only. Consider it as a tradeoff.\n")
+  } else if (lift_difference > 0) {
+    cat("\n  VERDICT: New warehouse version improves lift only. Reference version may still be safer.\n")
+  } else {
+    cat("\n  VERDICT: Earlier warehouse version is still stronger. Keep the earlier one.\n")
+  }
+}
+```
+
+```{r}
+# CHUNK FINAL — One Final Deck Table (clean + presentation ready)
+
+final_deck_table <- bind_rows(
+  lapply(seq_along(sector_picks), function(i) {
+
+    segment_name <- sector_picks[[i]]$segment
+    selected_horizon <- sector_picks[[i]]$horizon
+    selected_variant <- sector_picks[[i]]$variant
+
+    # If no signal
+    if (is.na(selected_horizon)) {
+      return(
+        tibble(
+          segment = segment_name,
+          horizon = "No signal",
+          model = "Baseline only",
+          indicator = "—",
+          baseline_RMSE = NA,
+          enhanced_RMSE = NA,
+          lift_pct = NA,
+          enhanced_MAPE = NA,
+          takeaway = "No reliable early signal"
+        )
+      )
+    }
+
+    result <- all_sector_results[[segment_name]][[selected_horizon]]
+    baseline_rmse <- result$metrics$baseline$RMSE
+
+    if (selected_variant == "Levels") {
+      enhanced_rmse <- result$metrics$aug_lvl$RMSE
+      enhanced_mape <- result$metrics$aug_lvl$MAPE
+      indicator_used <- result$best_lvl_indicator
+    } else if (selected_variant == "Change-in") {
+      enhanced_rmse <- result$metrics$aug_chg$RMSE
+      enhanced_mape <- result$metrics$aug_chg$MAPE
+      indicator_used <- paste0("d_", result$best_chg_indicator)
+    } else {
+      enhanced_rmse <- result$metrics$aug_full$RMSE
+      enhanced_mape <- result$metrics$aug_full$MAPE
+      indicator_used <- "All indicators"
+    }
+
+    lift <- (baseline_rmse - enhanced_rmse) / baseline_rmse * 100
+
+    takeaway_text <- case_when(
+      enhanced_mape <= 10 ~ "Strong signal",
+      enhanced_mape <= 30 ~ "Usable signal",
+      TRUE ~ "Weak signal"
+    )
+
+    tibble(
+      segment = segment_name,
+      horizon = selected_horizon,
+      model = selected_variant,
+      indicator = indicator_used,
+      baseline_RMSE = baseline_rmse,
+      enhanced_RMSE = enhanced_rmse,
+      lift_pct = lift,
+      enhanced_MAPE = enhanced_mape,
+      takeaway = takeaway_text
+    )
+  })
+)
+
+final_deck_table %>%
+  mutate(
+    baseline_RMSE = comma(round(baseline_RMSE)),
+    enhanced_RMSE = comma(round(enhanced_RMSE)),
+    lift_pct = percent(lift_pct / 100, accuracy = 0.1),
+    enhanced_MAPE = percent(enhanced_MAPE / 100, accuracy = 0.1)
+  ) %>%
+  kable(caption = "Final Segment Summary — Best Model per Segment") %>%
+  kable_styling(full_width = FALSE)
+```
+
