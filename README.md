@@ -225,7 +225,7 @@ Nagesh Pentakota\
 Bhuvaneshwar Sanappareddy · Sai Ram Jella · Gemechu Tola
 
 **Advisor:**\
-Professor Michael Gorman — University of Dayton MBAN Program
+Professor Michael Gorman - University of Dayton MBAN Program
 
 **Client:**\
 Lithko Contracting
